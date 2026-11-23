@@ -1,0 +1,14 @@
+[package]
+name = "psr-lan"
+version = "0.1.0"
+description = "Remote Play on the home network: finding, waking and (later) linking consoles. Ported from chiaki-ng."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+psr-crypto = { path = "../psr-crypto" }
+thiserror = "=2.0.21"
+
+[lints]
+workspace = true

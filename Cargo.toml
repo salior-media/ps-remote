@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/psr-crypto", "crates/psr-fec", "crates/psr-proto", "crates/psr-takion"]
+members = ["crates/psr-crypto", "crates/psr-fec", "crates/psr-proto", "crates/psr-takion", "crates/psr-lan"]
 
 [workspace.package]
 edition = "2024"
