@@ -1,0 +1,11 @@
+[workspace]
+resolver = "3"
+members = ["crates/psr-crypto"]
+
+[workspace.package]
+edition = "2024"
+license = "AGPL-3.0-only"
+repository = "https://github.com/salior-media/ps-remote"
+
+[workspace.lints.clippy]
+all = "warn"
