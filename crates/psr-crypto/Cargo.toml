@@ -1,0 +1,19 @@
+[package]
+name = "psr-crypto"
+version = "0.1.0"
+description = "Remote Play cryptography: registration (rpcrypt), stream (gkcrypt) and key exchange (ecdh). Ported from chiaki-ng."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+aes = "=0.9.4"
+aes-gcm = { version = "=0.11.1", default-features = false, features = ["aes"] }
+getrandom = "=0.4.3"
+k256 = { version = "=0.14.0", default-features = false, features = ["ecdh", "arithmetic", "alloc"] }
+hmac = "=0.13.0"
+sha2 = "=0.11.1"
+thiserror = "=2.0.21"
+
+[lints]
+workspace = true
