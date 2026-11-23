@@ -1,0 +1,16 @@
+[package]
+name = "psr-fec"
+version = "0.1.0"
+description = "Cauchy Reed-Solomon over GF(2^8), matching the console's Jerasure encoding. Ported from chiaki-ng."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror = "=2.0.21"
+
+[dev-dependencies]
+base64 = "=0.23.1"
+
+[lints]
+workspace = true
