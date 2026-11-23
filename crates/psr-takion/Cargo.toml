@@ -1,0 +1,18 @@
+[package]
+name = "psr-takion"
+version = "0.1.0"
+description = "Takion, the Remote Play stream transport: packets, MACs, reordering. Ported from chiaki-ng."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+psr-crypto = { path = "../psr-crypto" }
+subtle = "=2.6.1"
+thiserror = "=2.0.21"
+
+[dev-dependencies]
+base64 = "=0.23.1"
+
+[lints]
+workspace = true
