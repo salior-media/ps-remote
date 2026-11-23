@@ -762,6 +762,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "psr-lan"
+version = "0.1.0"
+dependencies = [
+ "psr-crypto",
+ "thiserror",
+]
+
+[[package]]
 name = "psr-proto"
 version = "0.1.0"
 dependencies = [
