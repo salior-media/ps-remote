@@ -1,0 +1,17 @@
+[package]
+name = "psr-proto"
+version = "0.1.0"
+description = "The Remote Play stream's protobuf messages (takion.proto), from chiaki-ng."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+prost = "=0.14.4"
+
+[build-dependencies]
+prost-build = "=0.14.4"
+protox = "=0.9.1"
+
+[lints]
+workspace = true
