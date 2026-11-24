@@ -13,6 +13,8 @@ use psr_crypto::Target;
 use psr_crypto::ecdh::Ecdh;
 use psr_crypto::gkcrypt::GkCrypt;
 use psr_crypto::rpcrypt::RpCrypt;
+use psr_input::controller::{ControllerState, button};
+use psr_input::feedback;
 use psr_lan::LanError;
 use psr_lan::session::Codec;
 use psr_av::frame::split_frame;
@@ -160,6 +162,31 @@ struct Seen {
     big: psr_proto::BigPayload,
     after_info: Vec<(u16, TakionMessage)>,
     disconnect_reason: String,
+    feedback: Vec<SeenFeedback>,
+}
+
+/// A controller feedback datagram as the fake console read it: MAC checked, payload decrypted.
+#[derive(Debug)]
+struct SeenFeedback {
+    packet_type: u8,
+    seq_num: u16,
+    count: u8,
+    payload: Vec<u8>,
+}
+
+/// Checks a feedback datagram the way the console must: the MAC over the whole datagram with the MAC
+/// field zeroed and the key position in place, then the payload decrypted one block past that position.
+fn read_feedback(crypt: &GkCrypt, d: &[u8]) -> SeenFeedback {
+    let key_pos = u64::from(u32::from_be_bytes(d[4..8].try_into().unwrap()));
+    let mut zeroed = d.to_vec();
+    zeroed[8..12].fill(0);
+    assert_eq!(crypt.gmac(key_pos, &zeroed), d[8..12], "feedback MAC");
+    SeenFeedback {
+        packet_type: d[0],
+        seq_num: u16::from_be_bytes([d[1], d[2]]),
+        count: d[3],
+        payload: crypt.crypt(key_pos + 16, &d[12..]),
+    }
 }
 
 const CONSOLE_TAG: u32 = 0x0bad_cafe;
@@ -295,8 +322,14 @@ fn fake_console(socket: UdpSocket, q: Quirks) -> std::thread::JoinHandle<Seen> {
         let mut after_info = Vec::new();
         let mut disconnect_reason = String::new();
         let mut sent_extras = false;
+        let mut feedback = Vec::new();
+        let client_crypt = GkCrypt::new(2, &hk, &secret);
         while disconnect_reason.is_empty() {
             let d = recv(&socket);
+            if matches!(d[0], 1 | 6) {
+                feedback.push(read_feedback(&client_crypt, &d));
+                continue;
+            }
             let (got, _) = receiver.handle(&d).expect("the client's datagrams carry valid MACs");
             for r in got {
                 let Received::Data { channel, data, .. } = r else { continue };
@@ -330,7 +363,7 @@ fn fake_console(socket: UdpSocket, q: Quirks) -> std::thread::JoinHandle<Seen> {
                 socket.send(&d).unwrap();
             }
         }
-        Seen { big, after_info, disconnect_reason }
+        Seen { big, after_info, disconnect_reason, feedback }
     })
 }
 
@@ -361,6 +394,14 @@ fn run_against_fake_console(q: Quirks) {
     assert_eq!(events.last(), Some(&StreamEvent::Disconnected("Server shutting down".into())));
     assert_eq!(s.dropped(), u64::from(q.forged_video), "only the forged datagram is dropped");
     s.request_keyframe().unwrap();
+    // D-pad down pressed and released, then 250 ms of polling: the release repeats, and a state packet
+    // falls due.
+    s.set_controller_state(&ControllerState { buttons: button::DPAD_DOWN, ..Default::default() }).unwrap();
+    s.set_controller_state(&ControllerState::default()).unwrap();
+    let until = std::time::Instant::now() + Duration::from_millis(250);
+    while std::time::Instant::now() < until {
+        s.poll(Duration::from_millis(10)).unwrap();
+    }
     s.disconnect().unwrap();
 
     let seen = console.join().unwrap();
@@ -382,6 +423,18 @@ fn run_against_fake_console(q: Quirks) {
     assert_eq!(feedback.len(), 2, "{:?}", seen.after_info);
     assert_eq!(feedback[0].corrupt_payload.map(|c| (c.start, c.end)), Some((2, 2)));
     assert_eq!(feedback[1].r#type, PayloadType::Idrrequest as i32);
+
+    let history: Vec<&SeenFeedback> = seen.feedback.iter().filter(|f| f.packet_type == 1).collect();
+    assert!(history.len() >= 2, "{:?}", seen.feedback);
+    assert_eq!((history[0].seq_num, history[0].count, &history[0].payload[..]), (0, 0, &[0x80, 0x81, 0xff][..]), "the press");
+    let release = [0x80, 0x81, 0x00, 0x80, 0x81, 0xff];
+    assert_eq!((history[1].seq_num, history[1].count, &history[1].payload[..]), (1, 1, &release[..]), "the release, counted less one");
+    assert!(history[2..].iter().all(|h| h.seq_num == 1 && h.payload == release), "repeats of the release only");
+    assert!(history.len() >= 4, "the release repeats at 20 and 50 ms and more: {}", history.len());
+    let state: Vec<&SeenFeedback> = seen.feedback.iter().filter(|f| f.packet_type == 6).collect();
+    assert!(!state.is_empty(), "a state packet within 200 ms of connecting");
+    assert_eq!(state[0].payload, feedback::format_v12(&(&ControllerState::default()).into()));
+    assert_eq!((state[0].seq_num, state[0].count), (0, 0));
     let mic = seen.after_info[2].1.stream_info_payload.as_ref().unwrap();
     assert_eq!(mic.audio_header, stream::microphone_audio_header());
     assert_eq!(seen.disconnect_reason, "Client Disconnecting");

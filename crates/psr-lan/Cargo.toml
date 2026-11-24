@@ -11,6 +11,7 @@ base64 = "=0.23.1"
 getrandom = "=0.4.3"
 prost = "=0.14.4"
 psr-av = { path = "../psr-av" }
+psr-input = { path = "../psr-input" }
 psr-crypto = { path = "../psr-crypto" }
 psr-proto = { path = "../psr-proto" }
 psr-takion = { path = "../psr-takion" }
