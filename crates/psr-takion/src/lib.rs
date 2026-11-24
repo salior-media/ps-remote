@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Takion, the Remote Play stream transport: the pure parts. Ported from chiaki-ng `lib/src/takion.c`,
-//! `reorderqueue.c`, `takionsendbuffer.c` and `seqnum.h`.
+//! Takion, the Remote Play stream transport. Ported from chiaki-ng `lib/src/takion.c`, `reorderqueue.c`,
+//! `takionsendbuffer.c` and `seqnum.h`.
 //!
-//! Nothing here touches a socket. The connect handshake, the receive loop and resend timers need the
-//! session to drive them and arrive with it (step 6 of `docs/PORT-MAP.md`).
+//! Nothing here touches a socket: [`connection`] holds a connection's state and builds and reads its
+//! datagrams, and psr-lan's stream connection drives it over UDP.
 
 pub mod av;
+pub mod connection;
 pub mod message;
 pub mod packet;
 pub mod reorder;
@@ -34,4 +35,6 @@ pub enum TakionError {
     SendBufferFull(usize),
     #[error("sequence number {0:#x} is already waiting for an acknowledgement")]
     DuplicateSeqNum(u32),
+    #[error("the console sent something else while ps-remote expected {0}")]
+    Unexpected(&'static str),
 }

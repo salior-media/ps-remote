@@ -281,6 +281,11 @@ impl Session {
         self.target
     }
 
+    /// The auth cipher made from the session's nonce.
+    pub fn rpcrypt(&self) -> &RpCrypt {
+        self.cipher.crypt()
+    }
+
     pub fn session_id(&self) -> &str {
         &self.session_id
     }

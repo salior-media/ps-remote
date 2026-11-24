@@ -1,7 +1,7 @@
 [package]
 name = "psr-lan"
 version = "0.1.0"
-description = "Remote Play on the home network: finding, waking and (later) linking consoles. Ported from chiaki-ng."
+description = "Remote Play on the home network: finding, waking and linking consoles, and starting a stream. Ported from chiaki-ng."
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -9,7 +9,10 @@ repository.workspace = true
 [dependencies]
 base64 = "=0.23.1"
 getrandom = "=0.4.3"
+prost = "=0.14.4"
 psr-crypto = { path = "../psr-crypto" }
+psr-proto = { path = "../psr-proto" }
+psr-takion = { path = "../psr-takion" }
 thiserror = "=2.0.21"
 
 [dev-dependencies]
