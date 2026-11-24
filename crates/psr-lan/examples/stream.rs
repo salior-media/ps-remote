@@ -73,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("{frames} whole frames ({} kB, largest {largest} bytes, {fec} rebuilt with FEC)", bytes / 1000);
     println!("{corrupt} corrupt-frame reports, {} frames lost", s.frames_lost());
-    println!("{audio} audio datagrams, {messages} other messages, {} datagrams dropped", s.dropped());
+    println!("{audio} Opus frames, {messages} other messages, {} datagrams dropped", s.dropped());
     match ended {
         Some(reason) => println!("the console ended the stream: {reason:?}"),
         None => {
