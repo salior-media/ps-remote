@@ -5,6 +5,7 @@
 
 pub mod auth;
 pub mod devices;
+pub mod holepunch;
 pub mod push;
 pub mod rps;
 pub mod secret;
@@ -29,6 +30,8 @@ pub enum PsnError {
     Seal,
     #[error("timed out waiting for {0}")]
     Timeout(&'static str),
+    #[error("the console ended the remote-play session")]
+    Terminated,
     #[error("the configuration folder: {0}")]
     Io(std::io::Error),
 }
@@ -92,4 +95,18 @@ pub(crate) fn reply(
         return Err(PsnError::Status { what, code, reason: json.as_ref().and_then(refusal_reason) });
     }
     json.ok_or(PsnError::MissingField("body"))
+}
+
+/// As [`reply`], for requests whose success may come with no body at all (Sony answers some with 204).
+pub(crate) fn reply_any(
+    what: &'static str,
+    sent: Result<ureq::http::Response<ureq::Body>, ureq::Error>,
+) -> Result<Option<serde_json::Value>, PsnError> {
+    let mut r = sent.map_err(|e| PsnError::Network(e.to_string()))?;
+    let code = r.status().as_u16();
+    let json: Option<serde_json::Value> = r.body_mut().read_json().ok();
+    if !(200..300).contains(&code) {
+        return Err(PsnError::Status { what, code, reason: json.as_ref().and_then(refusal_reason) });
+    }
+    Ok(json)
 }
