@@ -110,11 +110,17 @@ pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Writes `contents` to a new file at `path` that only this user may read (0600 on Unix). An existing file
-/// is removed first, so a file made earlier with looser permissions does not keep them.
+/// Writes `contents` to `path` so that only this user may read it (0600 on Unix), and so the file is either
+/// the old one or the new one whole, never missing or half written: the new contents go to a fresh
+/// `<name>.tmp` first, which then replaces `path`. A file made earlier with looser permissions is replaced, so
+/// it does not keep them.
 pub fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    match std::fs::remove_file(path) {
+    let mut tmp_name = path.file_name().ok_or(std::io::ErrorKind::InvalidInput)?.to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    // A temporary left by a write that was killed halfway.
+    match std::fs::remove_file(&tmp) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
@@ -126,7 +132,11 @@ pub fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    options.open(path)?.write_all(contents)
+    let mut f = options.open(&tmp)?;
+    f.write_all(contents)?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, path)
 }
 
 /// Saves the console as `<mac>.txt` in `dir`, creating the folder. The file holds the console's keys, so

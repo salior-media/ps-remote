@@ -38,3 +38,17 @@ fn on_unix_only_the_owner_can_read() {
     assert_eq!(std::fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o600);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn a_write_replaces_the_file_whole_and_survives_a_stale_temporary() {
+    let dir = temp_dir("atomic");
+    store::create_private_dir(&dir).unwrap();
+    let f = dir.join("secret");
+    store::write_private(&f, b"one").unwrap();
+    // A temporary left by a write that was killed halfway does not block the next.
+    std::fs::write(dir.join("secret.tmp"), b"half").unwrap();
+    store::write_private(&f, b"two").unwrap();
+    assert_eq!(std::fs::read(&f).unwrap(), b"two");
+    assert!(!dir.join("secret.tmp").exists(), "no temporary is left behind");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

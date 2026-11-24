@@ -68,7 +68,7 @@ fn psn_consoles() -> Result<(), Error> {
         println!("no PS5 on this account");
     }
     for d in &list {
-        println!("{}  Remote Play {}", d.name, if d.remote_play { "on" } else { "off" });
+        println!("{}  Remote Play {}", psr_psn::printable(&d.name), if d.remote_play { "on" } else { "off" });
     }
     Ok(())
 }
@@ -101,7 +101,9 @@ async fn main() -> Result<(), Error> {
         ["psn-consoles"] => tokio::task::spawn_blocking(psn_consoles).await?,
         ["signout"] => {
             secret::forget(&config_dir()?)?;
-            println!("Signed out: the PSN sign-in is forgotten.");
+            println!("Signed out on this machine: the saved PSN sign-in is deleted.");
+            println!("It stays valid at Sony until it expires; to cut it off now, remove the Remote Play app's access");
+            println!("in your PSN account's security settings.");
             Ok(())
         }
         _ => Err(USAGE.into()),

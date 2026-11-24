@@ -202,3 +202,34 @@ fn spaces_are_sent_as_percent_20_and_plus_signs_survive() {
     assert_eq!(f[1], ("refresh_token".to_string(), "a+b c".to_string()), "a real '+' in a value stays one");
     assert_eq!(f[2].1, SCOPE);
 }
+
+#[test]
+fn the_redirect_must_be_exactly_sonys_page() {
+    for bad in [
+        "https://u:p@remoteplay.dl.playstation.net/remoteplay/redirect?code=X",
+        "https://remoteplay.dl.playstation.net:4443/remoteplay/redirect?code=X",
+    ] {
+        assert!(matches!(auth::code_from_redirect(bad), Err(PsnError::NotRedirect)), "{bad}");
+    }
+    assert!(
+        auth::code_from_redirect("https://remoteplay.dl.playstation.net:443/remoteplay/redirect?code=X").is_ok(),
+        "443 is https's own port"
+    );
+}
+
+#[test]
+fn text_from_the_network_is_printed_without_control_characters() {
+    let reason =
+        psr_psn::refusal_reason(&json!({"error":"bad\u{1b}]0;title\u{7}", "error_description":"line\nbreak"})).unwrap();
+    assert!(!reason.chars().any(char::is_control), "{reason:?}");
+    assert_eq!(psr_psn::printable("PS5\u{1b}[2J-455"), "PS5?[2J-455");
+    assert_eq!(psr_psn::printable("PS5-455 lounge"), "PS5-455 lounge");
+}
+
+#[test]
+fn requests_never_leave_https_or_follow_a_redirect() {
+    let agent = psr_psn::agent();
+    assert!(agent.config().https_only(), "a plain-http URL is refused");
+    assert_eq!(agent.config().max_redirects(), 0, "a redirect could resend the token to another address");
+    assert_eq!(agent.config().timeouts().global, Some(auth::TIMEOUT));
+}

@@ -16,8 +16,13 @@ mod dpapi {
         CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
     };
 
-    fn blob(data: &[u8]) -> CRYPT_INTEGER_BLOB {
-        CRYPT_INTEGER_BLOB { cbData: data.len() as u32, pbData: data.as_ptr().cast_mut() }
+    /// Binds the sealed token to ps-remote: another program running as the same user has to know it too.
+    /// This is hardening, not a boundary: it is in this public source.
+    const ENTROPY: &[u8] = b"ps-remote psn-refresh-token v1";
+
+    /// `None` for data too large for DPAPI's 32-bit length.
+    fn blob(data: &[u8]) -> Option<CRYPT_INTEGER_BLOB> {
+        Some(CRYPT_INTEGER_BLOB { cbData: u32::try_from(data.len()).ok()?, pbData: data.as_ptr().cast_mut() })
     }
 
     /// Copies the output blob and frees it with `LocalFree`, as DPAPI requires.
@@ -25,7 +30,10 @@ mod dpapi {
     /// # Safety
     /// `out` must be a blob DPAPI filled in.
     unsafe fn take(out: CRYPT_INTEGER_BLOB) -> Vec<u8> {
-        // SAFETY: DPAPI set pbData to cbData readable bytes it allocated with LocalAlloc.
+        if out.pbData.is_null() {
+            return Vec::new();
+        }
+        // SAFETY: DPAPI set pbData, not null, to cbData readable bytes it allocated with LocalAlloc.
         let v = unsafe { std::slice::from_raw_parts(out.pbData, out.cbData as usize) }.to_vec();
         // SAFETY: pbData came from LocalAlloc and is freed once.
         unsafe { LocalFree(out.pbData.cast()) };
@@ -33,14 +41,15 @@ mod dpapi {
     }
 
     pub fn protect(data: &[u8]) -> Option<Vec<u8>> {
-        let input = blob(data);
+        let input = blob(data)?;
+        let entropy = blob(ENTROPY)?;
         let mut out = CRYPT_INTEGER_BLOB { cbData: 0, pbData: std::ptr::null_mut() };
-        // SAFETY: input points at `data` for the call; out is written by the call on success.
+        // SAFETY: input and entropy point at live slices for the call; out is written by the call on success.
         let ok = unsafe {
             CryptProtectData(
                 &input,
                 std::ptr::null(),
-                std::ptr::null(),
+                &entropy,
                 std::ptr::null(),
                 std::ptr::null(),
                 CRYPTPROTECT_UI_FORBIDDEN,
@@ -51,15 +60,18 @@ mod dpapi {
         (ok != 0).then(|| unsafe { take(out) })
     }
 
-    pub fn unprotect(data: &[u8]) -> Option<Vec<u8>> {
-        let input = blob(data);
+    /// With `with_entropy` false, opens a token sealed before ps-remote added its entropy.
+    pub fn unprotect(data: &[u8], with_entropy: bool) -> Option<Vec<u8>> {
+        let input = blob(data)?;
+        let entropy = blob(ENTROPY)?;
+        let entropy_ptr: *const CRYPT_INTEGER_BLOB = if with_entropy { &entropy } else { std::ptr::null() };
         let mut out = CRYPT_INTEGER_BLOB { cbData: 0, pbData: std::ptr::null_mut() };
         // SAFETY: as in `protect`.
         let ok = unsafe {
             CryptUnprotectData(
                 &input,
                 std::ptr::null_mut(),
-                std::ptr::null(),
+                entropy_ptr,
                 std::ptr::null(),
                 std::ptr::null(),
                 CRYPTPROTECT_UI_FORBIDDEN,
@@ -81,8 +93,10 @@ pub fn seal(plain: &[u8]) -> Result<Vec<u8>, PsnError> {
 
 /// The reverse of [`seal`]. On Windows it fails for another user or machine, or for altered bytes.
 pub fn open(sealed: &[u8]) -> Result<Vec<u8>, PsnError> {
+    // A token sealed before the entropy was added (the first sign-ins, 2026-11-25) opens without it; it is
+    // sealed with it at the next save.
     #[cfg(windows)]
-    return dpapi::unprotect(sealed).ok_or(PsnError::Seal);
+    return dpapi::unprotect(sealed, true).or_else(|| dpapi::unprotect(sealed, false)).ok_or(PsnError::Seal);
     #[cfg(not(windows))]
     Ok(sealed.to_vec())
 }
@@ -108,7 +122,8 @@ pub fn load_refresh_token(config_dir: &Path) -> Result<Option<String>, PsnError>
     String::from_utf8(plain).map(Some).map_err(|_| PsnError::Seal)
 }
 
-/// Forgets the sign-in.
+/// Forgets the sign-in on this machine. It does not revoke it at Sony: that is done in the PSN account's
+/// own settings.
 pub fn forget(config_dir: &Path) -> Result<(), PsnError> {
     match std::fs::remove_file(path(config_dir)) {
         Ok(()) => Ok(()),

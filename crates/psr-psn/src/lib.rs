@@ -46,7 +46,7 @@ pub fn refusal_reason(body: &serde_json::Value) -> Option<String> {
     .into_iter()
     .flatten()
     .collect();
-    let mut reason = parts.join(" ");
+    let mut reason = printable(&parts.join(" "));
     if reason.is_empty() {
         return None;
     }
@@ -56,9 +56,23 @@ pub fn refusal_reason(body: &serde_json::Value) -> Option<String> {
     Some(reason)
 }
 
-/// An agent with chiaki-ng's timeout that hands back refusals as responses, so their reason can be read.
-pub(crate) fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder().timeout_global(Some(auth::TIMEOUT)).http_status_as_error(false).build().into()
+/// Text from the network made safe to print: control characters (a terminal's escape sequences among them)
+/// become `?`.
+pub fn printable(text: &str) -> String {
+    text.chars().map(|c| if c.is_control() { '?' } else { c }).collect()
+}
+
+/// The agent every PSN request goes through: chiaki-ng's timeout, HTTPS only, and no redirects (a redirect
+/// could send a request carrying a token on to another address). Refusals come back as responses, so their
+/// reason can be read.
+pub fn agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(auth::TIMEOUT))
+        .https_only(true)
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .build()
+        .into()
 }
 
 /// The JSON body of a successful reply, or the refusal with Sony's reason. `what` names the request.

@@ -43,7 +43,13 @@ pub fn login_url() -> String {
 pub fn code_from_redirect(address: &str) -> Result<String, PsnError> {
     let url = Url::parse(address.trim()).map_err(|_| PsnError::NotRedirect)?;
     let redirect = Url::parse(REDIRECT_URI).expect("a valid constant");
-    if url.scheme() != "https" || url.host_str() != redirect.host_str() || url.path() != redirect.path() {
+    let exact = url.scheme() == "https"
+        && url.host_str() == redirect.host_str()
+        && url.path() == redirect.path()
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.password().is_none();
+    if !exact {
         return Err(PsnError::NotRedirect);
     }
     url.query_pairs()
