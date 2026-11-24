@@ -46,7 +46,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let Some((name, duid)) = &console else { return Ok(()) };
         let started = holepunch::start(&tokens.access, &session.created, duid, &mut ws)?;
         println!("{}  {name} joined the session; customData1 is {} bytes", t(), started.custom_data1.len());
-        let offer = holepunch::wait_message(&mut ws, &[Action::Offer], Instant::now() + holepunch::START_TIMEOUT)?;
+        let peer = holepunch::Peer { session_id: &session.created.session_id, console_duid: duid };
+        let offer =
+            holepunch::wait_message(&mut ws, &peer, &[Action::Offer], Instant::now() + holepunch::START_TIMEOUT)?;
         let req = offer.conn_request.as_ref();
         let kinds: Vec<String> =
             req.map(|r| r.candidates.iter().map(|c| format!("{:?}", c.kind)).collect()).unwrap_or_default();
@@ -58,7 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             kinds.len(),
             kinds
         );
-        let ack = holepunch::short_message("RESULT", offer.req_id, 0);
+        let ack = holepunch::result_message(offer.req_id);
         holepunch::send_message(&tokens.access, &session.created, duid, &ack)?;
         println!("{}  acknowledged the offer", t());
         Ok(())
