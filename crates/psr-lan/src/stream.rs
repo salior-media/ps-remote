@@ -2,7 +2,7 @@
 //! The stream connection: Takion over UDP port 9296, the BIG / BANG key exchange, and the console's stream
 //! info. Ported from chiaki-ng `lib/src/streamconnection.c` and `lib/src/launchspec.c`
 //! (LicenseRef-AGPL-3.0-only-OpenSSL). Video comes out as whole frames, put back in order and rebuilt by
-//! psr-av; audio datagrams are handed up as they come.
+//! psr-av, and audio as Opus frames.
 //!
 //! **Difference from chiaki-ng:** Senkusha, chiaki-ng's MTU and latency probe, is not run. chiaki-ng
 //! carries on without it when it fails, with an MTU of 1454 and an RTT of 1 ms, and those are the values
@@ -18,6 +18,7 @@ use psr_crypto::ecdh::Ecdh;
 use psr_crypto::gkcrypt::{GkCrypt, HANDSHAKE_KEY_SIZE};
 use psr_crypto::rpcrypt::RpCrypt;
 use psr_proto::takion_message::PayloadType;
+use psr_av::audio::{AudioFrame, AudioReceiver};
 use psr_av::video::{VideoEvent, VideoReceiver};
 use psr_input::controller::ControllerState;
 use psr_input::feedback;
@@ -268,8 +269,8 @@ fn disconnect_reason(msg: &TakionMessage) -> String {
 pub enum StreamEvent {
     /// A codec header, a whole frame, or frames reported lost (the report is already sent).
     Video(VideoEvent),
-    /// An audio or haptics datagram, MAC checked. Payload still encrypted.
-    Audio(Vec<u8>),
+    /// An Opus frame, decrypted, each one once.
+    Audio(AudioFrame),
     /// A protobuf message other than the ones handled here.
     Message(Box<TakionMessage>),
     /// The console ended the stream.
@@ -300,6 +301,7 @@ pub struct Stream {
     /// Made once the stream info has given the codec headers.
     video: Option<VideoReceiver>,
     early_video: Vec<Vec<u8>>,
+    audio: AudioReceiver,
     feedback: FeedbackSender,
 }
 
@@ -394,6 +396,7 @@ pub fn connect_at(
         video_queue: AvQueue::new(),
         video: None,
         early_video: Vec::new(),
+        audio: AudioReceiver::new(),
         feedback: FeedbackSender::new(Instant::now()),
     };
     for d in stream.sender.split_data(CHANNEL, &big, (FALLBACK_MTU - MTU_OVERHEAD) as usize)? {
@@ -494,11 +497,26 @@ impl Stream {
                 if datagram.first().is_some_and(|b| b & 0xf == VIDEO_TYPE) {
                     self.video_datagram(datagram)?;
                 } else {
-                    self.pending.push(StreamEvent::Audio(datagram));
+                    self.audio_datagram(&datagram);
                 }
             }
         }
         Ok(())
+    }
+
+    /// chiaki-ng `stream_connection_takion_av` for audio: decrypts the packet and takes out its Opus frames.
+    /// A packet that fails its checks is dropped and counted, as chiaki-ng logs and drops it.
+    fn audio_datagram(&mut self, datagram: &[u8]) {
+        let Some(crypt) = self.receiver.crypt() else { return };
+        let Ok(p) = av::parse(self.av_version, datagram, self.receiver.key_state()) else {
+            self.dropped += 1;
+            return;
+        };
+        let data = crypt.crypt(p.key_pos + BLOCK_SIZE as u64, p.data);
+        match self.audio.av_packet(&AvPacket { data: &data, ..p }) {
+            Ok(frames) => self.pending.extend(frames.into_iter().map(StreamEvent::Audio)),
+            Err(_) => self.dropped += 1,
+        }
     }
 
     /// Puts a video datagram in order and hands on whatever that releases.

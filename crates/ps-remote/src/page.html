@@ -1,0 +1,124 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ps-remote</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+  body { margin: 0; padding: 16px; display: grid; gap: 12px; max-width: 1280px; }
+  video { width: 100%; aspect-ratio: 16 / 9; background: #000; border-radius: 6px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  #status { font-family: ui-monospace, monospace; font-size: 13px; opacity: 0.8; }
+</style>
+</head>
+<body>
+<h1>ps-remote</h1>
+<div class="row">
+  <select id="console" aria-label="Console"><option>Looking for consoles…</option></select>
+  <button id="play" disabled>Play</button>
+  <button id="stop">Stop</button>
+</div>
+<video id="video" autoplay playsinline muted></video>
+<div class="row">
+  <button id="sound">Sound on</button>
+  <span>Input: a gamepad, or the arrow keys, Enter (cross) and Backspace (circle) while this page has focus.</span>
+</div>
+<div id="status">Not playing.</div>
+<script>
+"use strict";
+const TOKEN = "{{TOKEN}}";
+const auth = { Authorization: "Bearer " + TOKEN };
+const $ = (id) => document.getElementById(id);
+let pc = null, channel = null, lastSent = "";
+
+// psr-input's button bits, by the standard gamepad layout's index.
+const PAD_BITS = { 0: 1 << 0, 1: 1 << 1, 2: 1 << 2, 3: 1 << 3, 4: 1 << 8, 5: 1 << 9, 8: 1 << 13, 9: 1 << 12,
+  10: 1 << 10, 11: 1 << 11, 12: 1 << 6, 13: 1 << 7, 14: 1 << 4, 15: 1 << 5, 16: 1 << 15, 17: 1 << 14 };
+const KEY_BITS = { ArrowUp: 1 << 6, ArrowDown: 1 << 7, ArrowLeft: 1 << 4, ArrowRight: 1 << 5,
+  Enter: 1 << 0, Backspace: 1 << 1 };
+let keyButtons = 0;
+
+async function api(path, options = {}) {
+  const r = await fetch("/api" + path, { ...options, headers: { ...auth, ...(options.headers || {}) } });
+  if (!r.ok) throw new Error(path + ": " + r.status + " " + (await r.text()));
+  return r;
+}
+
+async function listConsoles() {
+  const list = await (await api("/consoles")).json();
+  const sel = $("console");
+  sel.textContent = "";
+  for (const c of list) {
+    const o = document.createElement("option");
+    o.value = JSON.stringify({ console: c.mac, host: c.address });
+    o.textContent = (c.nickname || c.mac) + (c.address ? " (" + c.address + ", " + c.state + ")" : " (not found on this network)");
+    o.disabled = !c.address;
+    sel.append(o);
+  }
+  $("play").disabled = !list.some((c) => c.address);
+}
+
+function stick(v) { return Math.max(-32768, Math.min(32767, Math.round(v * 32767))); }
+
+function readInput() {
+  let buttons = keyButtons, l2 = 0, r2 = 0, lx = 0, ly = 0, rx = 0, ry = 0;
+  for (const pad of navigator.getGamepads ? navigator.getGamepads() : []) {
+    if (!pad || pad.mapping !== "standard") continue;
+    pad.buttons.forEach((b, i) => { if (b.pressed && PAD_BITS[i]) buttons |= PAD_BITS[i]; });
+    l2 = Math.max(l2, Math.round((pad.buttons[6]?.value || 0) * 255));
+    r2 = Math.max(r2, Math.round((pad.buttons[7]?.value || 0) * 255));
+    [lx, ly, rx, ry] = pad.axes.slice(0, 4).map(stick);
+  }
+  return { buttons, l2, r2, lx, ly, rx, ry };
+}
+
+function flushInput() {
+  if (channel && channel.readyState === "open") {
+    const msg = JSON.stringify(readInput());
+    if (msg !== lastSent) { channel.send(msg); lastSent = msg; }
+  }
+}
+
+// Gamepads can only be polled, once per frame. Keys are sent as they change, so a tap shorter than a
+// frame still reaches the console as a press and a release.
+function sendInput() { flushInput(); requestAnimationFrame(sendInput); }
+
+window.addEventListener("keydown", (e) => { if (KEY_BITS[e.key]) { keyButtons |= KEY_BITS[e.key]; e.preventDefault(); flushInput(); } });
+window.addEventListener("keyup", (e) => { if (KEY_BITS[e.key]) { keyButtons &= ~KEY_BITS[e.key]; e.preventDefault(); flushInput(); } });
+
+async function play() {
+  const choice = JSON.parse($("console").value);
+  $("status").textContent = "Starting the session…";
+  await api("/play", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(choice) });
+  if (pc) pc.close();
+  pc = new RTCPeerConnection();
+  pc.addTransceiver("video", { direction: "recvonly" });
+  pc.addTransceiver("audio", { direction: "recvonly" });
+  channel = pc.createDataChannel("input");
+  const media = new MediaStream();
+  pc.ontrack = (e) => { media.addTrack(e.track); $("video").srcObject = media; };
+  await pc.setLocalDescription(await pc.createOffer());
+  const answer = await (await api("/offer", { method: "POST", headers: { "Content-Type": "application/sdp" }, body: pc.localDescription.sdp })).text();
+  await pc.setRemoteDescription({ type: "answer", sdp: answer });
+}
+
+async function showStatus() {
+  try {
+    const s = await (await api("/status")).json();
+    $("status").textContent = s.running
+      ? `Playing. Browser ${s.browser_connected ? "connected" : "connecting"}. ${s.frames} frames (${s.frames_lost} lost), ${s.audio_frames} audio frames, ${s.bad_input} bad input messages.`
+      : (s.ended ? "Ended: " + s.ended : "Not playing.");
+  } catch (e) { $("status").textContent = String(e); }
+}
+
+$("play").onclick = () => play().catch((e) => { $("status").textContent = String(e); });
+$("stop").onclick = async () => { if (pc) pc.close(); pc = null; channel = null; await api("/stop", { method: "POST" }); };
+$("sound").onclick = () => { $("video").muted = false; $("video").play(); };
+listConsoles().catch((e) => { $("status").textContent = String(e); });
+setInterval(showStatus, 1000);
+requestAnimationFrame(sendInput);
+</script>
+</body>
+</html>
