@@ -3,9 +3,11 @@
 //! `takionsendbuffer.c` and `seqnum.h`.
 //!
 //! Nothing here touches a socket: [`connection`] holds a connection's state and builds and reads its
-//! datagrams, and psr-lan's stream connection drives it over UDP.
+//! datagrams, [`av_queue`] puts video datagrams back in order, and psr-lan's stream connection drives
+//! them over UDP.
 
 pub mod av;
+pub mod av_queue;
 pub mod connection;
 pub mod message;
 pub mod packet;

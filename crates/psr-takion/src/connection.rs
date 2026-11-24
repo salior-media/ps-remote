@@ -285,6 +285,11 @@ impl Receiver {
         self.key_state
     }
 
+    /// The console's keys, once set: they also decrypt video and audio payloads.
+    pub fn crypt(&self) -> Option<&GkCrypt> {
+        self.crypt.as_ref()
+    }
+
     /// chiaki-ng `takion_handle_packet`. Returns what the datagram carried and, when data was delivered,
     /// the sequence number to acknowledge. A datagram whose MAC fails is an error and changes nothing.
     pub fn handle(&mut self, datagram: &[u8]) -> Result<(Vec<Received>, Option<u32>), TakionError> {
