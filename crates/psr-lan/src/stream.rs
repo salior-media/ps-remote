@@ -19,6 +19,9 @@ use psr_crypto::gkcrypt::{GkCrypt, HANDSHAKE_KEY_SIZE};
 use psr_crypto::rpcrypt::RpCrypt;
 use psr_proto::takion_message::PayloadType;
 use psr_av::video::{VideoEvent, VideoReceiver};
+use psr_input::controller::ControllerState;
+use psr_input::feedback;
+use psr_input::sender::{Feedback, FeedbackSender};
 use psr_crypto::gkcrypt::BLOCK_SIZE;
 use psr_proto::{BigPayload, ControllerConnectionPayload, CorruptFramePayload, DisconnectPayload, StreamInfoPayload, TakionMessage};
 use psr_takion::av::{self, AvPacket, AvVersion};
@@ -297,6 +300,7 @@ pub struct Stream {
     /// Made once the stream info has given the codec headers.
     video: Option<VideoReceiver>,
     early_video: Vec<Vec<u8>>,
+    feedback: FeedbackSender,
 }
 
 impl std::fmt::Debug for Stream {
@@ -390,6 +394,7 @@ pub fn connect_at(
         video_queue: AvQueue::new(),
         video: None,
         early_video: Vec::new(),
+        feedback: FeedbackSender::new(Instant::now()),
     };
     for d in stream.sender.split_data(CHANNEL, &big, (FALLBACK_MTU - MTU_OVERHEAD) as usize)? {
         stream.socket.send(&d).map_err(io)?;
@@ -424,6 +429,8 @@ pub fn connect_at(
     stream.send_message(CHANNEL, &controller_connection_message())?;
     stream.send_message(CHANNEL, &microphone_message())?;
     stream.last_heartbeat = Instant::now();
+    // chiaki-ng starts its feedback sender once the stream is connected.
+    stream.feedback = FeedbackSender::new(Instant::now());
     Ok(stream)
 }
 
@@ -444,6 +451,34 @@ impl Stream {
     }
 
     /// Asks the console for a keyframe: the answer to a decoder that lost its picture (a WebRTC PLI).
+    /// Sets what the controller is doing now: buttons, triggers, sticks, touches and motion. The change
+    /// goes out at once, and is repeated as chiaki-ng repeats it while [`Stream::poll`] keeps running.
+    pub fn set_controller_state(&mut self, state: &ControllerState) -> Result<(), LanError> {
+        self.feedback.set_controller_state(state);
+        self.send_feedback()
+    }
+
+    /// Sends the controller feedback that is due (chiaki-ng's feedback sender thread).
+    fn send_feedback(&mut self) -> Result<(), LanError> {
+        for f in self.feedback.poll(Instant::now()) {
+            let d = match f {
+                Feedback::State { seq_num, state } => {
+                    let bytes = if self.av_version == AvVersion::V12 {
+                        feedback::format_v12(&state).to_vec()
+                    } else {
+                        feedback::format_v9(&state).to_vec()
+                    };
+                    self.sender.feedback_state(seq_num, &bytes)?
+                }
+                Feedback::History { seq_num, event_count, events } => {
+                    self.sender.feedback_history(seq_num, event_count, &events)?
+                }
+            };
+            self.socket.send(&d).map_err(io)?;
+        }
+        Ok(())
+    }
+
     pub fn request_keyframe(&mut self) -> Result<(), LanError> {
         self.send_message(VIDEO_FEEDBACK_CHANNEL, &idr_request_message())
     }
@@ -575,11 +610,14 @@ impl Stream {
             self.send_message(CHANNEL, &heartbeat_message())?;
             self.last_heartbeat = Instant::now();
         }
-        // Wake in time to skip a lost video packet, as chiaki-ng's receive loop does.
-        let timeout = self
-            .video_queue
-            .next_deadline()
-            .map_or(timeout, |d| timeout.min(d.saturating_duration_since(Instant::now())));
+        self.send_feedback()?;
+        // Wake in time to skip a lost video packet, as chiaki-ng's receive loop does, and for the next
+        // controller feedback.
+        let now = Instant::now();
+        let timeout = [self.video_queue.next_deadline(), Some(self.feedback.next_deadline())]
+            .into_iter()
+            .flatten()
+            .fold(timeout, |t, d| t.min(d.saturating_duration_since(now)));
         if self.pending.is_empty()
             && let Some(first) = recv(&self.socket, timeout)?
         {

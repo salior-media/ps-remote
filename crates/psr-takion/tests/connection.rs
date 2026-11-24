@@ -230,3 +230,24 @@ fn a_verified_av_datagram_moves_the_key_state() {
     assert_eq!(got, [Received::Av(signed)]);
     assert_eq!(r.key_state(), psr_crypto::gkcrypt::KeyState::default().commit(1000));
 }
+
+#[test]
+fn feedback_packets_need_keys_and_advance_the_key_position_by_payload_plus_a_block() {
+    let mut s = Sender::new(1, 2);
+    assert!(matches!(s.feedback_state(0, &[0; 0x1c]), Err(TakionError::Unexpected(_))));
+    s.set_crypt(crypt(2));
+    let state = [7u8; 0x1c];
+    let first = s.feedback_state(5, &state).unwrap();
+    assert_eq!(first.len(), connection::FEEDBACK_HEADER_SIZE + state.len());
+    assert_eq!(first[..4], [6, 0, 5, 0], "type 6, sequence number, one state (sent as 0)");
+    assert_eq!(first[4..8], [0; 4], "the first key position");
+    assert_eq!(crypt(2).crypt(16, &first[12..]), state, "encrypted one block past the key position");
+    let mut zeroed = first.clone();
+    zeroed[8..12].fill(0);
+    assert_eq!(crypt(2).gmac(0, &zeroed), first[8..12]);
+    // 0x1c + 16 = 44 bytes, padded by 44 % 16 = 12, as chiaki-ng pads.
+    let second = s.feedback_history(9, 3, &[1, 2, 3, 4, 5, 6, 7]).unwrap();
+    assert_eq!(second[..4], [1, 0, 9, 2], "type 1, and three events sent as 2");
+    assert_eq!(u32::from_be_bytes(second[4..8].try_into().unwrap()), 44 + 12);
+    assert_eq!(s.key_pos(), 56 + 23 + 7);
+}

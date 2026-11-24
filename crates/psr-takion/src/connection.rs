@@ -6,7 +6,7 @@
 //! `chiaki_takion_send_message_data_ack`, `takion_handle_packet` and `takion_flush_data_queue`.
 //! The socket loop that drives it lives with the stream connection in psr-lan.
 
-use psr_crypto::gkcrypt::{BLOCK_SIZE, GkCrypt, KeyState};
+use psr_crypto::gkcrypt::{BLOCK_SIZE, GMAC_SIZE, GkCrypt, KeyState};
 
 use crate::TakionError;
 use crate::message::{self, ChunkType, MESSAGE_HEADER_SIZE};
@@ -23,6 +23,9 @@ const DATA_QUEUE_SIZE_EXP: u32 = 4;
 /// The data header in front of a first (or only) chunk: sequence number, channel, two zero bytes, and the
 /// data type. A continuation chunk has no data type byte.
 const DATA_HEADER: usize = 9;
+/// Type, sequence number, count, key position and MAC, before a feedback packet's payload.
+pub const FEEDBACK_HEADER_SIZE: usize = 0xc;
+const FEEDBACK_MAC_OFFSET: usize = 8;
 
 /// chiaki-ng `ChiakiTakionMessageDataType`.
 pub mod data_type {
@@ -208,6 +211,41 @@ impl Sender {
         p.extend_from_slice(&[0; 4]);
         let datagram = control(self.tag_remote, key_pos, ChunkType::DataAck, 0, &p);
         self.finish(datagram, key_pos)
+    }
+
+    /// chiaki-ng `chiaki_takion_send_feedback_state`: the sticks and motion, already formatted for the
+    /// protocol version (psr-input's `format_v9` or `format_v12`). One state per packet.
+    pub fn feedback_state(&mut self, seq_num: u16, state: &[u8]) -> Result<Vec<u8>, TakionError> {
+        // chiaki-ng sends the number of states in the packet less one.
+        self.feedback(PacketType::FeedbackState, seq_num, 0, state)
+    }
+
+    /// chiaki-ng `chiaki_takion_send_feedback_history`: button and touch events, newest first. The count
+    /// is sent less one, because the console adds one back.
+    pub fn feedback_history(&mut self, seq_num: u16, event_count: u8, events: &[u8]) -> Result<Vec<u8>, TakionError> {
+        self.feedback(PacketType::FeedbackHistory, seq_num, event_count.saturating_sub(1), events)
+    }
+
+    /// chiaki-ng `takion_send_feedback_packet`: a 12-byte header (type, sequence number, count, key
+    /// position, MAC), then the payload encrypted one block past the key position. The MAC covers the
+    /// whole datagram, key position included.
+    fn feedback(&mut self, ty: PacketType, seq_num: u16, count: u8, payload: &[u8]) -> Result<Vec<u8>, TakionError> {
+        if self.crypt.is_none() {
+            return Err(TakionError::Unexpected("the stream keys before any controller feedback"));
+        }
+        let key_pos = self.advance_key_pos(payload.len() + BLOCK_SIZE);
+        let crypt = self.crypt.as_ref().expect("checked above");
+        let mut d = Vec::with_capacity(FEEDBACK_HEADER_SIZE + payload.len());
+        d.push(ty.code());
+        d.extend_from_slice(&seq_num.to_be_bytes());
+        d.push(count);
+        // chiaki-ng writes the low 32 bits of the key position.
+        d.extend_from_slice(&(key_pos as u32).to_be_bytes());
+        d.extend_from_slice(&[0; GMAC_SIZE]);
+        d.extend(crypt.crypt(key_pos + BLOCK_SIZE as u64, payload));
+        let mac = crypt.gmac(key_pos, &d);
+        d[FEEDBACK_MAC_OFFSET..FEEDBACK_MAC_OFFSET + GMAC_SIZE].copy_from_slice(&mac);
+        Ok(d)
     }
 
     /// chiaki-ng `stream_connection_send_big`'s split: chunks of `mtu - 26` then `mtu - 25` bytes,

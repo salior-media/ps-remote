@@ -1,0 +1,12 @@
+[package]
+name = "psr-input"
+version = "0.1.0"
+description = "Controller state for Remote Play, and the feedback packets that carry it to the console. Ported from chiaki-ng."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
