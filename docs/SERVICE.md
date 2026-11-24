@@ -69,8 +69,10 @@ session, play sending credentials to any address, loose file modes on Unix, an a
 starts. Each is fixed above, with a test.
 - **WebRTC media on the LAN address, not loopback:** Firefox refuses 127.0.0.1 candidates (str0m's own example says so).
   The UDP port is chosen at random for each session.
-- **str0m with its `rust-crypto` backend:** pure Rust, like `psr-crypto`, so there is no OpenSSL or C toolchain.
-  str0m 0.25.0 (2026-11-03) is pinned: 0.26.0 is less than two weeks old (port map §2's version note).
+- **str0m with its `rust-crypto` backend:** no OpenSSL. It is not pure Rust, as this said at first (corrected
+  2026-11-25): str0m's DTLS certificate is made by `rcgen` on aws-lc, a C library, through `dimpl`'s `rcgen`
+  feature, which str0m does not let a user turn off. str0m 0.25.0 (2026-11-03) is pinned: 0.26.0 was less than two
+  weeks old (port map §2's version note).
 - **Audio without chiaki-ng's jitter buffer:** chiaki-ng buffers audio for its own player. A WebRTC receiver has its
   own jitter buffer, so the service sends each Opus frame once, as soon as it arrives, numbered by its frame index.
 

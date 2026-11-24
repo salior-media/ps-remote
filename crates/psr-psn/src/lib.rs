@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Remote Play over PSN, from away from home (`docs/PSN.md`). Step 9a: signing in on Sony's own page, keeping
-//! only the refresh token (encrypted on Windows), and listing the account's consoles.
+//! only the refresh token (encrypted on Windows), and listing the account's consoles. Step 9b: Sony's push
+//! notifications and the remote-play session the holepunch meets in.
 
 pub mod auth;
 pub mod devices;
+pub mod push;
+pub mod rps;
 pub mod secret;
 
 #[derive(Debug, thiserror::Error)]
@@ -24,6 +27,8 @@ pub enum PsnError {
     Network(String),
     #[error("the saved sign-in could not be encrypted or decrypted for this user")]
     Seal,
+    #[error("timed out waiting for {0}")]
+    Timeout(&'static str),
     #[error("the configuration folder: {0}")]
     Io(std::io::Error),
 }
