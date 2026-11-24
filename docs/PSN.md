@@ -88,9 +88,49 @@ before the real cause was found; whether Sony also accepts `+` was not tested.
   `chiaki_holepunch_session_start`, `http_start_session`, `decode_customdata1`, `session_message_get_payload`,
   `session_message_parse`, `short_message_serialize`, `http_send_session_message` and
   `wait_for_session_message`.
-- **9b-2b, the hole itself.** Our candidates (local, STUN, and port guessing), our offer, the UDP exchange that
-  finds a candidate that answers, and both accepts, for the control port and then the data port. It ports
-  `holepunch_session_create_offer`, `check_candidates` and `chiaki_holepunch_session_punch_hole`.
+- **9b-2b, the hole itself.** Our candidates and offer (`punch.rs`), our public address from STUN (`stun.rs`),
+  the UDP exchange that finds a candidate that answers, and both accepts. It ports
+  `holepunch_session_create_offer`, `send_offer`, `send_accept`, `session_message_serialize`,
+  `wait_for_session_message_ack`, `check_candidates`, `send_response_ps`, `receive_request_send_response_ps`,
+  `chiaki_holepunch_session_punch_hole` and `stun_get_external_address_from_server`.
+
+**What 9b-2b does and does not do yet:**
+- The **control hole** is punched and verified live on the LAN (below).
+- The **data hole** uses the same code (`Puncher::punch(.., Port::Data)`) but is **not verified**. The console
+  offers it only once registration, the session request and the control protocol have run over the control hole
+  (chiaki-ng `session.c`, the `holepunch_session_create_offer` call before `CHIAKI_HOLEPUNCH_PORT_TYPE_DATA`), and
+  those come with 9c. chiaki-ng's own `holepunch-test.c` punches only the control hole for the same reason.
+- **Not ported yet:** UPnP port mappings, IPv6, and port guessing for NATs that allocate ports in steps or at
+  random (chiaki-ng's four-server allocation test and up to 250 probing sockets). Without them, a console and a
+  client both behind such NATs will not meet; a cone NAT on either side is enough for the hole.
+- **Not tested from another network yet.** On the LAN, the console's `LOCAL` candidate wins; from outside, its
+  `STATIC` one (its public address) would have to.
+
+**Differences from chiaki-ng** (each in the module notes of `punch.rs` and `stun.rs`):
+- **The STUN servers are only chiaki-ng's built-in ones,** never a list downloaded at run time, and a reply counts
+  only if it comes from the server asked.
+- **A DERIVED candidate must share an IP address with an offered one.** chiaki-ng sends our request, whose ID is all
+  a response needs, to any address that sends us a datagram, so anyone who found our port could answer in the
+  console's place.
+- **Malformed datagrams are passed over** rather than ending the exchange, and the answering after the hole stops
+  after 32 requests.
+- **Our local address is the route's** to the STUN server, not the first wired adapter.
+
+**9b-2b against the household's PS5, on the LAN (2026-11-25):**
+1. The control hole was punched about 10 s after the console joined: the console's `LOCAL` candidate answered our
+   request, both ACCEPTs went through, and the socket is connected to the console. Its response carried its own
+   hashed ID first and ours second, the mirror of our request (recorded, not yet required).
+2. **The console holds its ACCEPT until its own UDP requests on the new hole are answered.** The first port answered
+   them only after the accepts, and the console acknowledged our ACCEPT but never sent its own. chiaki-ng answers
+   them for a second at the end of `check_candidates`, before the ACCEPT; the port now does too.
+3. **The console's ACCEPT has an empty `localHashedId`**, as ours does. 9b-2a refused an empty one; now an empty
+   base64 field reads as zeros, as chiaki-ng's decoder leaves it, and any other must still be exactly 16 or 20 bytes.
+4. While we waited for the console to acknowledge our offer, it sent another OFFER (request 1, 5 or 7 across runs).
+   It is passed over, as chiaki-ng passes it over.
+5. **The push websocket no longer mistakes UDP time for a dead server.** The punch spends seconds on UDP without
+   reading the websocket; a pong that arrived meanwhile now has two seconds of the next read to be found
+   (`push::pong_overdue`), where before the read would have given up on the server at once. This was found by
+   reading the code while porting, not seen live.
 
 **9b-2a against the household's PS5 (2026-11-25):**
 1. The PS5 was in rest mode, and the `remotePlay` command woke it: it joined the session about 19 s after the
@@ -133,4 +173,5 @@ before the real cause was found; whether Sony also accepts `+` was not tested.
 ## What 9a does not do yet
 
 9a doesn't wake a console over PSN, run the holepunch session, or carry any media. 9b-1 adds the session's control
-plane; the rest is 9b-2 and 9c.
+plane, 9b-2a wakes the console and reads its offer, and 9b-2b punches the control hole. RUDP over that hole,
+registration, the data hole and the stream are 9c.
