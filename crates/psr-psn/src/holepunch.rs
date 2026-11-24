@@ -40,7 +40,7 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-fn random<const N: usize>() -> Result<[u8; N], PsnError> {
+pub(crate) fn random<const N: usize>() -> Result<[u8; N], PsnError> {
     let mut b = [0u8; N];
     getrandom::fill(&mut b).map_err(|e| PsnError::Network(format!("random numbers: {e}")))?;
     Ok(b)
@@ -290,8 +290,14 @@ fn parse_candidate(c: &serde_json::Value) -> Result<Candidate, PsnError> {
     Ok(Candidate { kind, addr, port, addr_mapped: ip("mappedAddr")?, port_mapped: int(c, "mappedPort")? })
 }
 
+/// A base64 field of exactly `N` bytes. An empty one is all zeros: chiaki-ng's decoder leaves its zeroed buffer
+/// as it is, and both its ACCEPT and the console's send `localHashedId` empty (seen live, 2026-11-25).
 fn fixed<const N: usize>(c: &serde_json::Value, field: &'static str) -> Result<[u8; N], PsnError> {
-    let bytes = B64.decode(text(c, field)?).map_err(|_| PsnError::BadField(field))?;
+    let text = text(c, field)?;
+    if text.is_empty() {
+        return Ok([0; N]);
+    }
+    let bytes = B64.decode(text).map_err(|_| PsnError::BadField(field))?;
     bytes.try_into().map_err(|_| PsnError::BadField(field))
 }
 

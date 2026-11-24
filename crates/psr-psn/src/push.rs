@@ -232,6 +232,16 @@ impl<S: Write> Write for Deadline<S> {
 // The deadline is under TLS, on the socket: rustls may read the socket several times in one read of its own.
 type Tls = StreamOwned<ClientConnection, Deadline<TcpStream>>;
 
+/// How long a read has, after [`Push::next`] is called, to find a pong that came while nobody was reading.
+pub const PONG_GRACE: Duration = Duration::from_secs(2);
+
+/// Whether the ping sent at `last_ping` has gone unanswered too long: past [`PING_INTERVAL`], and past
+/// [`PONG_GRACE`] since this read began (`entered`). Time between reads does not count against the server: the
+/// holepunch spends seconds on UDP with the websocket unread, and its pong waits in the socket meanwhile.
+pub fn pong_overdue(awaiting: bool, last_ping: Instant, entered: Instant, now: Instant) -> bool {
+    awaiting && now.duration_since(last_ping) > PING_INTERVAL && now.duration_since(entered) > PONG_GRACE
+}
+
 /// An open push connection (chiaki-ng's websocket, without its thread).
 pub struct Push {
     ws: WebSocket<Tls>,
@@ -395,15 +405,16 @@ impl Push {
     }
 
     /// The next notification before `deadline`, keeping the connection alive with a ping every five
-    /// seconds as chiaki-ng does. `None` when the deadline passes first. A missing pong, a close, or a broken
-    /// connection is an error.
+    /// seconds as chiaki-ng does. `None` when the deadline passes first. A missing pong (see [`pong_overdue`]),
+    /// a close, or a broken connection is an error.
     pub fn next(&mut self, deadline: Instant) -> Result<Option<Notification>, PsnError> {
+        let entered = Instant::now();
         loop {
             let now = Instant::now();
-            if self.awaiting_pong.is_some() && now.duration_since(self.last_ping) > PING_INTERVAL {
+            if pong_overdue(self.awaiting_pong.is_some(), self.last_ping, entered, now) {
                 return Err(PsnError::Network("the push server stopped answering pings".into()));
             }
-            if now.duration_since(self.last_ping) >= PING_INTERVAL {
+            if self.awaiting_pong.is_none() && now.duration_since(self.last_ping) >= PING_INTERVAL {
                 let mut payload = [0u8; 8];
                 getrandom::fill(&mut payload).map_err(|e| PsnError::Network(format!("random numbers: {e}")))?;
                 // No deadline on the stream while sending: it is for reads.
@@ -416,7 +427,7 @@ impl Push {
                 return Ok(None);
             }
             // Wake for the next ping, or the caller's deadline, whichever is first, however slowly a frame arrives.
-            let wake = (self.last_ping + PING_INTERVAL).min(deadline);
+            let wake = (self.last_ping + PING_INTERVAL).max(entered + PONG_GRACE).max(now).min(deadline);
             self.bound_reads(wake - now, wake)?;
             match self.ws.read() {
                 Ok(Message::Text(t)) => {
