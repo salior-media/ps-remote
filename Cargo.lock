@@ -1718,10 +1718,14 @@ dependencies = [
  "base64",
  "getrandom 0.4.3",
  "psr-lan",
+ "rustls",
  "serde_json",
+ "sha2",
  "thiserror",
+ "tungstenite",
  "ureq",
  "url",
+ "webpki-roots",
  "windows-sys 0.61.2",
 ]
 
@@ -2404,6 +2408,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
+]
+
+[[package]]
+name = "tungstenite"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e48ac77174b19c110a50ab2128b24215ac9cb40e0e12e093fb602d175c569d22"
+dependencies = [
+ "bytes",
+ "data-encoding",
+ "http",
+ "httparse",
+ "log",
+ "rand 0.10.4",
+ "sha1",
+ "thiserror",
 ]
 
 [[package]]

@@ -74,6 +74,37 @@ four scopes was then refused: `invalid_scope`, Sony's code 4153.
 Request bodies send spaces as `%20`, closest to chiaki-ng's plain spaces. This was changed during the diagnosis,
 before the real cause was found; whether Sony also accepts `+` was not tested.
 
+## 9b in detail
+
+9b is split in two, because `holepunch.c`'s session is about 4,000 lines:
+
+- **9b-1, the control plane (this branch).** Sony's push websocket, and a remote-play session at the session
+  manager: create it, see Sony's "created" and "joined" notifications, and leave it. The console is not involved
+  yet. It ports `get_websocket_fqdn`, `websocket_thread_func`, `parse_notification_type`, `http_create_session`,
+  `chiaki_holepunch_session_create` and `deleteSession`.
+- **9b-2, the hole itself.** The session start sent to the console, the console's offer and our accept, the
+  candidates (local, STUN, and port guessing), and the UDP exchange that punches the hole. It ports
+  `chiaki_holepunch_session_start`, `holepunch_session_create_offer`, `check_candidates` and
+  `chiaki_holepunch_session_punch_hole`.
+
+**Three findings from verifying 9b-1 (2026-11-25):**
+
+1. **Sony's push server sends an incomplete certificate chain.** It sends its own certificate
+   (`*.np.communication.playstation.net`) without the intermediate `COMODO RSA Domain Validation Secure Server CA`,
+   and rustls refused it: `UnknownIssuer`. chiaki-ng fetches the intermediate from the certificate's AIA address.
+   psr-psn ships that one public certificate instead (`crates/psr-psn/certs/README.md`) and offers it to rustls's own
+   WebPKI verifier beside the server's chain, so the root, signatures, dates and host name are all still checked.
+   `tests/push.rs` replays the real server certificate: it fails without the intermediate, passes with it, and still
+   fails for another host name, after the certificate's expiry, or with an altered intermediate.
+2. **The push server refuses (HTTP 403) a token signed in without a client device ID.** chiaki-ng's GUI appends
+   `duid=<16 random bytes after 0000000700410080>` to its sign-in address (`QmlBackend::psnLoginUrl`). The port
+   copied `LOGIN_URL` without that step. The sign-in address now carries one, and signing in again made the
+   websocket open.
+3. **A wrong guess first:** before finding the device ID, I took the 403 to be tungstenite lowercasing header names,
+   and wrote the upgrade request by hand with chiaki-ng's spelling. It was still 403. The hand-written handshake
+   stays, because it leaves nothing about the request to a library, but header case was not the cause.
+
 ## What 9a does not do yet
 
-It doesn't wake a console over PSN, run the holepunch session, or carry any media. Those are 9b and 9c.
+9a doesn't wake a console over PSN, run the holepunch session, or carry any media. 9b-1 adds the session's control
+plane; the rest is 9b-2 and 9c.

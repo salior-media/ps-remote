@@ -18,9 +18,11 @@ const CHIAKI_LOGIN_URL: &str = "https://auth.api.sonyentertainmentnetwork.com/2.
 fn the_sign_in_page_is_chiaki_ngs_with_no_spaces() {
     // chiaki-ng's web view encodes the spaces between the scopes; a printed address must do it itself, or
     // copying it from a terminal cuts it at the first space and signs in with one scope only.
-    let url = auth::login_url();
+    // chiaki-ng's QmlBackend::psnLoginUrl appends "duid=<client device ID>&".
+    let duid = auth::client_duid().unwrap();
+    let url = auth::login_url(&duid);
     assert!(!url.contains(' '), "{url}");
-    assert_eq!(url, CHIAKI_LOGIN_URL.replace("%1", CLIENT_ID).replace(' ', "%20"));
+    assert_eq!(url, format!("{}duid={duid}&", CHIAKI_LOGIN_URL.replace("%1", CLIENT_ID).replace(' ', "%20")));
     let parsed = url::Url::parse(&url).unwrap();
     let scope = parsed.query_pairs().find(|(k, _)| k == "scope").unwrap().1.into_owned();
     assert_eq!(scope, SCOPE, "Sony reads all four scopes");
@@ -232,4 +234,13 @@ fn requests_never_leave_https_or_follow_a_redirect() {
     assert!(agent.config().https_only(), "a plain-http URL is refused");
     assert_eq!(agent.config().max_redirects(), 0, "a redirect could resend the token to another address");
     assert_eq!(agent.config().timeouts().global, Some(auth::TIMEOUT));
+}
+
+#[test]
+fn a_client_device_id_is_chiaki_ngs_prefix_and_16_random_bytes() {
+    let (a, b) = (auth::client_duid().unwrap(), auth::client_duid().unwrap());
+    assert_eq!(a.len(), 48);
+    assert!(a.starts_with(auth::DUID_PREFIX));
+    assert!(a.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)));
+    assert_ne!(a, b, "a new one each time");
 }

@@ -39,7 +39,7 @@ fn app_secret() -> Result<String, Error> {
 
 fn signin() -> Result<(), Error> {
     let secret = app_secret()?;
-    println!("1. Open this address in your browser and sign in to PSN on Sony's page:\n\n{}\n", auth::login_url());
+    println!("1. Open this address in your browser and sign in to PSN on Sony's page:\n\n{}\n", auth::login_url(&auth::client_duid()?));
     println!("2. When the page shows \"redirect\", copy the whole address from the address bar and paste it here:");
     let mut pasted = String::new();
     std::io::stdin().lock().read_line(&mut pasted)?;

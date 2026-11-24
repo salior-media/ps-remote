@@ -26,15 +26,28 @@ pub const SCOPE: &str = "psn:clientapp referenceDataService:countryConfig.read p
 /// chiaki-ng's timeout for each PSN request.
 pub const TIMEOUT: Duration = Duration::from_secs(5);
 
-/// chiaki-ng `PSNAuth::LOGIN_URL`: Sony's sign-in page for the Remote Play app, with the spaces between the
-/// scopes written as `%20`. chiaki-ng opens its address in its own web view, which encodes them; this one is
-/// printed for the person to open, and an address copied from a terminal stops at its first space, which
-/// signs in with `psn:clientapp` alone. Every later refresh asking for the four scopes is then refused as
-/// `invalid_scope` (seen 2026-11-25).
-pub fn login_url() -> String {
+/// chiaki-ng `DUID_PREFIX`: the start of a client device ID.
+pub const DUID_PREFIX: &str = "0000000700410080";
+
+/// A new client device ID (chiaki-ng `chiaki_holepunch_generate_client_device_uid`): [`DUID_PREFIX`] and 16
+/// random bytes, as lowercase hex.
+pub fn client_duid() -> Result<String, PsnError> {
+    let mut b = [0u8; 16];
+    getrandom::fill(&mut b).map_err(|e| PsnError::Network(format!("random numbers: {e}")))?;
+    Ok(format!("{DUID_PREFIX}{}", b.iter().map(|x| format!("{x:02x}")).collect::<String>()))
+}
+
+/// Sony's sign-in page for the Remote Play app, as chiaki-ng's `QmlBackend::psnLoginUrl` makes it:
+/// `PSNAuth::LOGIN_URL` and then `duid=<client device ID>&`. The device ID ties the sign-in to a client, and
+/// Sony's push server refuses (HTTP 403) a token signed in without one (seen 2026-11-25).
+///
+/// The spaces between the scopes are written as `%20`. chiaki-ng opens its address in its own web view,
+/// which encodes them; this one is printed for the person to open, and an address copied from a terminal
+/// stops at its first space, which signs in with `psn:clientapp` alone (also seen 2026-11-25).
+pub fn login_url(duid: &str) -> String {
     let scope = SCOPE.replace(' ', "%20");
     format!(
-        "https://auth.api.sonyentertainmentnetwork.com/2.0/oauth/authorize?service_entity=urn:service-entity:psn&response_type=code&client_id={CLIENT_ID}&redirect_uri={REDIRECT_URI}&scope={scope}&request_locale=en_US&ui=pr&service_logo=ps&layout_type=popup&smcid=remoteplay&prompt=always&PlatformPrivacyWs1=minimal&"
+        "https://auth.api.sonyentertainmentnetwork.com/2.0/oauth/authorize?service_entity=urn:service-entity:psn&response_type=code&client_id={CLIENT_ID}&redirect_uri={REDIRECT_URI}&scope={scope}&request_locale=en_US&ui=pr&service_logo=ps&layout_type=popup&smcid=remoteplay&prompt=always&PlatformPrivacyWs1=minimal&duid={duid}&"
     )
 }
 
