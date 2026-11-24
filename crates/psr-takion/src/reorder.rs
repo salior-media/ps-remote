@@ -162,6 +162,19 @@ impl<S: SeqNum, T> ReorderQueue<S, T> {
         Some((seq, value))
     }
 
+    /// Moves `begin` past the empty slots at the front of the window and returns how many it passed.
+    /// Nothing moves when the window holds no element at all. chiaki-ng does this by writing `begin` and
+    /// `count` directly, in `takion_av_queue_flush_with_timeout`.
+    pub fn skip_missing_head(&mut self) -> u64 {
+        let skipped = (0..self.count).take_while(|&i| self.peek(i).is_none()).count() as u64;
+        if skipped >= self.count {
+            return 0;
+        }
+        self.begin = self.begin.wrapping_add_n(skipped);
+        self.count -= skipped;
+        skipped
+    }
+
     /// Everything still in the window, in order (chiaki-ng calls the drop callback with these in `fini`).
     pub fn drain(&mut self) -> Vec<(S, T)> {
         let out = (0..self.count)

@@ -1033,6 +1033,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "psr-av"
+version = "0.1.0"
+dependencies = [
+ "psr-fec",
+ "psr-takion",
+ "thiserror",
+]
+
+[[package]]
 name = "psr-crypto"
 version = "0.1.0"
 dependencies = [
@@ -1060,6 +1069,7 @@ dependencies = [
  "base64",
  "getrandom 0.4.3",
  "prost",
+ "psr-av",
  "psr-crypto",
  "psr-proto",
  "psr-takion",

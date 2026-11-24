@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The stream connection: Takion over UDP port 9296, the BIG / BANG key exchange, and the console's stream
 //! info. Ported from chiaki-ng `lib/src/streamconnection.c` and `lib/src/launchspec.c`
-//! (LicenseRef-AGPL-3.0-only-OpenSSL). Video and audio datagrams are handed up as they come; turning them
-//! into frames is step 6c of `docs/PORT-MAP.md`.
+//! (LicenseRef-AGPL-3.0-only-OpenSSL). Video comes out as whole frames, put back in order and rebuilt by
+//! psr-av; audio datagrams are handed up as they come.
 //!
 //! **Difference from chiaki-ng:** Senkusha, chiaki-ng's MTU and latency probe, is not run. chiaki-ng
 //! carries on without it when it fails, with an MTU of 1454 and an RTT of 1 ms, and those are the values
@@ -18,7 +18,11 @@ use psr_crypto::ecdh::Ecdh;
 use psr_crypto::gkcrypt::{GkCrypt, HANDSHAKE_KEY_SIZE};
 use psr_crypto::rpcrypt::RpCrypt;
 use psr_proto::takion_message::PayloadType;
-use psr_proto::{BigPayload, ControllerConnectionPayload, DisconnectPayload, StreamInfoPayload, TakionMessage};
+use psr_av::video::{VideoEvent, VideoReceiver};
+use psr_crypto::gkcrypt::BLOCK_SIZE;
+use psr_proto::{BigPayload, ControllerConnectionPayload, CorruptFramePayload, DisconnectPayload, StreamInfoPayload, TakionMessage};
+use psr_takion::av::{self, AvPacket, AvVersion};
+use psr_takion::av_queue::AvQueue;
 use psr_takion::connection::{self, Received, Receiver, Sender, data_type};
 
 use crate::LanError;
@@ -39,9 +43,17 @@ const MTU_OVERHEAD: u32 = 50;
 /// chiaki-ng `CHIAKI_AUDIO_HEADER_SIZE`.
 pub const AUDIO_HEADER_SIZE: usize = 0xe;
 const RECV_BUF: usize = 1500;
+/// At most this many datagrams are handled in one poll, so a flood cannot hold the caller there.
+const DRAIN_MAX: usize = 1024;
+/// The low nibble of a video datagram's first byte.
+const VIDEO_TYPE: u8 = 2;
 /// The channel the stream's protobuf messages use, and the one chiaki-ng acknowledges stream info on.
 const CHANNEL: u16 = 1;
 const STREAMINFO_ACK_CHANNEL: u16 = 9;
+/// chiaki-ng sends corrupt-frame reports and keyframe requests on channel 2.
+const VIDEO_FEEDBACK_CHANNEL: u16 = 2;
+/// Video datagrams kept while the stream info, which says how to read them, has not come yet.
+const EARLY_VIDEO_MAX: usize = 256;
 
 /// What to ask the console for (chiaki-ng `ChiakiConnectVideoProfile`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,6 +180,20 @@ pub fn microphone_message() -> Vec<u8> {
     .encode_to_vec()
 }
 
+/// chiaki-ng `stream_connection_send_corrupt_frame`: frames `start..=end` were lost or damaged.
+pub fn corrupt_frame_message(start: u16, end: u16) -> Vec<u8> {
+    TakionMessage {
+        corrupt_payload: Some(CorruptFramePayload { start: start.into(), end: end.into() }),
+        ..typed(PayloadType::Corruptframe)
+    }
+    .encode_to_vec()
+}
+
+/// chiaki-ng `stream_connection_send_idr_request`: asks the console for a keyframe.
+pub fn idr_request_message() -> Vec<u8> {
+    typed(PayloadType::Idrrequest).encode_to_vec()
+}
+
 pub fn disconnect_message() -> Vec<u8> {
     TakionMessage {
         disconnect_payload: Some(DisconnectPayload { reason: "Client Disconnecting".into(), extended_info: None }),
@@ -237,8 +263,10 @@ fn disconnect_reason(msg: &TakionMessage) -> String {
 /// What arrived on a running stream.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamEvent {
-    /// A video or audio datagram, MAC checked. Payload still encrypted.
-    Av { video: bool, datagram: Vec<u8> },
+    /// A codec header, a whole frame, or frames reported lost (the report is already sent).
+    Video(VideoEvent),
+    /// An audio or haptics datagram, MAC checked. Payload still encrypted.
+    Audio(Vec<u8>),
     /// A protobuf message other than the ones handled here.
     Message(Box<TakionMessage>),
     /// The console ended the stream.
@@ -264,6 +292,11 @@ pub struct Stream {
     pending: Vec<StreamEvent>,
     /// Datagrams dropped because they failed a check (MAC, tag, length).
     dropped: u64,
+    av_version: AvVersion,
+    video_queue: AvQueue<Vec<u8>>,
+    /// Made once the stream info has given the codec headers.
+    video: Option<VideoReceiver>,
+    early_video: Vec<Vec<u8>>,
 }
 
 impl std::fmt::Debug for Stream {
@@ -352,6 +385,11 @@ pub fn connect_at(
         last_heartbeat: Instant::now(),
         pending: Vec::new(),
         dropped: 0,
+        // chiaki-ng reads protocol 12's layout from a PS5 and protocol 9's from a PS4.
+        av_version: if target.is_ps5() { AvVersion::V12 } else { AvVersion::V9 },
+        video_queue: AvQueue::new(),
+        video: None,
+        early_video: Vec::new(),
     };
     for d in stream.sender.split_data(CHANNEL, &big, (FALLBACK_MTU - MTU_OVERHEAD) as usize)? {
         stream.socket.send(&d).map_err(io)?;
@@ -366,7 +404,7 @@ pub fn connect_at(
     for d in stream.receiver.set_crypt(remote) {
         // Video that came before the keys: handle it now that it can be checked.
         let (got, _) = stream.receiver.handle(&d)?;
-        stream.queue(got);
+        stream.queue(got)?;
     }
 
     let info = match early_info.take() {
@@ -378,6 +416,10 @@ pub fn connect_at(
         }
     };
     stream.info = parse_stream_info(&info)?;
+    stream.video = Some(VideoReceiver::new(stream.info.resolutions.iter().map(|r| r.video_header.clone()).collect()));
+    for d in std::mem::take(&mut stream.early_video) {
+        stream.video_datagram(d)?;
+    }
     stream.send_message(STREAMINFO_ACK_CHANNEL, &streaminfo_ack_message())?;
     stream.send_message(CHANNEL, &controller_connection_message())?;
     stream.send_message(CHANNEL, &microphone_message())?;
@@ -401,13 +443,64 @@ impl Stream {
         Ok(())
     }
 
-    fn queue(&mut self, got: Vec<Received>) {
+    /// Asks the console for a keyframe: the answer to a decoder that lost its picture (a WebRTC PLI).
+    pub fn request_keyframe(&mut self) -> Result<(), LanError> {
+        self.send_message(VIDEO_FEEDBACK_CHANNEL, &idr_request_message())
+    }
+
+    /// Frames lost so far, as the video receiver counts them.
+    pub fn frames_lost(&self) -> u64 {
+        self.video.as_ref().map_or(0, VideoReceiver::frames_lost_total)
+    }
+
+    fn queue(&mut self, got: Vec<Received>) -> Result<(), LanError> {
         for r in got {
             if let Received::Av(datagram) = r {
-                let video = datagram.first().is_some_and(|b| b & 0xf == 2);
-                self.pending.push(StreamEvent::Av { video, datagram });
+                if datagram.first().is_some_and(|b| b & 0xf == VIDEO_TYPE) {
+                    self.video_datagram(datagram)?;
+                } else {
+                    self.pending.push(StreamEvent::Audio(datagram));
+                }
             }
         }
+        Ok(())
+    }
+
+    /// Puts a video datagram in order and hands on whatever that releases.
+    fn video_datagram(&mut self, datagram: Vec<u8>) -> Result<(), LanError> {
+        if self.video.is_none() {
+            if self.early_video.len() < EARLY_VIDEO_MAX {
+                self.early_video.push(datagram);
+            }
+            return Ok(());
+        }
+        let Ok(p) = av::parse(self.av_version, &datagram, self.receiver.key_state()) else {
+            self.dropped += 1;
+            return Ok(());
+        };
+        let (packet_index, unit_index) = (p.packet_index, p.unit_index);
+        let ordered = self.video_queue.push(packet_index, unit_index, datagram, Instant::now());
+        self.video_ordered(ordered)
+    }
+
+    /// chiaki-ng `stream_connection_takion_av`: decrypts each packet and gives it to the video receiver.
+    fn video_ordered(&mut self, ordered: Vec<Vec<u8>>) -> Result<(), LanError> {
+        for datagram in ordered {
+            let (Some(crypt), Some(video)) = (self.receiver.crypt(), self.video.as_mut()) else { continue };
+            let Ok(p) = av::parse(self.av_version, &datagram, self.receiver.key_state()) else {
+                self.dropped += 1;
+                continue;
+            };
+            let data = crypt.crypt(p.key_pos + BLOCK_SIZE as u64, p.data);
+            let events = video.av_packet(&AvPacket { data: &data, ..p });
+            for e in events {
+                if let VideoEvent::CorruptFrames { start, end } = e {
+                    self.send_message(VIDEO_FEEDBACK_CHANNEL, &corrupt_frame_message(start, end))?;
+                }
+                self.pending.push(StreamEvent::Video(e));
+            }
+        }
+        Ok(())
     }
 
     /// Handles one datagram: checks it and returns the protobuf messages it carried, with the sequence
@@ -431,7 +524,7 @@ impl Stream {
                 other => rest.push(other),
             }
         }
-        self.queue(rest);
+        self.queue(rest)?;
         Ok((messages, ack))
     }
 
@@ -482,21 +575,54 @@ impl Stream {
             self.send_message(CHANNEL, &heartbeat_message())?;
             self.last_heartbeat = Instant::now();
         }
+        // Wake in time to skip a lost video packet, as chiaki-ng's receive loop does.
+        let timeout = self
+            .video_queue
+            .next_deadline()
+            .map_or(timeout, |d| timeout.min(d.saturating_duration_since(Instant::now())));
         if self.pending.is_empty()
-            && let Some(d) = recv(&self.socket, timeout)?
+            && let Some(first) = recv(&self.socket, timeout)?
         {
-            let (messages, ack) = self.take(&d)?;
-            self.ack(ack)?;
-            for m in messages {
-                let event = if m.r#type == PayloadType::Disconnect as i32 {
-                    StreamEvent::Disconnected(disconnect_reason(&m))
-                } else {
-                    StreamEvent::Message(Box::new(m))
-                };
-                self.pending.push(event);
+            self.handle(&first)?;
+            // Then everything already waiting: video comes in bursts of dozens of datagrams, and the
+            // system's receive buffer must not fill between two polls.
+            self.socket.set_nonblocking(true).map_err(io)?;
+            let drained = self.drain();
+            self.socket.set_nonblocking(false).map_err(io)?;
+            drained?;
+        }
+        let ordered = self.video_queue.flush(Instant::now());
+        self.video_ordered(ordered)?;
+        Ok(std::mem::take(&mut self.pending))
+    }
+
+    fn handle(&mut self, datagram: &[u8]) -> Result<(), LanError> {
+        let (messages, ack) = self.take(datagram)?;
+        self.ack(ack)?;
+        for m in messages {
+            let event = if m.r#type == PayloadType::Disconnect as i32 {
+                StreamEvent::Disconnected(disconnect_reason(&m))
+            } else {
+                StreamEvent::Message(Box::new(m))
+            };
+            self.pending.push(event);
+        }
+        Ok(())
+    }
+
+    /// Handles the datagrams already received, on a non-blocking socket, up to [`DRAIN_MAX`].
+    fn drain(&mut self) -> Result<(), LanError> {
+        let mut buf = [0u8; RECV_BUF];
+        for _ in 0..DRAIN_MAX {
+            match self.socket.recv(&mut buf) {
+                Ok(n) => self.handle(&buf[..n])?,
+                Err(e) if is_timeout(&e) => break,
+                // Windows reports an ICMP port-unreachable from an earlier send this way.
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+                Err(e) => return Err(io(e)),
             }
         }
-        Ok(std::mem::take(&mut self.pending))
+        Ok(())
     }
 
     /// chiaki-ng `stream_connection_send_disconnect`.

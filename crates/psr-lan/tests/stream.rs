@@ -15,6 +15,8 @@ use psr_crypto::gkcrypt::GkCrypt;
 use psr_crypto::rpcrypt::RpCrypt;
 use psr_lan::LanError;
 use psr_lan::session::Codec;
+use psr_av::frame::split_frame;
+use psr_av::video::VideoEvent;
 use psr_lan::stream::{self, StreamEvent, VideoProfile};
 use psr_proto::takion_message::PayloadType;
 use psr_proto::{BangPayload, ResolutionPayload, StreamInfoPayload, TakionMessage};
@@ -69,6 +71,9 @@ fn small_messages_match_nanopb() {
     assert_eq!((decoded.client_version, decoded.encrypted_key), (12, vec![0; 4]));
     let disconnect = TakionMessage::decode(stream::disconnect_message().as_slice()).unwrap();
     assert_eq!(disconnect.disconnect_payload.unwrap().reason, "Client Disconnecting");
+    assert_eq!(stream::idr_request_message(), [0x08, 0x19]);
+    let corrupt = TakionMessage::decode(stream::corrupt_frame_message(7, 9).as_slice()).unwrap();
+    assert_eq!((corrupt.r#type, corrupt.corrupt_payload.map(|c| (c.start, c.end))), (PayloadType::Corruptframe as i32, Some((7, 9))));
     let controller = TakionMessage::decode(stream::controller_connection_message().as_slice()).unwrap();
     let c = controller.controller_connection_payload.unwrap();
     assert_eq!((c.controller_id, c.connected, c.controller_type), (None, Some(true), Some(2)));
@@ -176,6 +181,49 @@ struct Quirks {
     forged_video: bool,
 }
 
+/// The fake console's video: frame 1 with one unit lost (FEC brings it back), no frame 2, then frame 3.
+const FRAME_1: usize = 300;
+const FRAME_3: usize = 100;
+const UNIT_SIZE: usize = 64;
+const LOST_UNIT: usize = 2;
+
+fn frame_bytes(index: u16, len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i as u8).wrapping_mul(29) ^ index as u8).collect()
+}
+
+/// A protocol 12 video datagram: the header chiaki-ng's `av_packet_parse` reads, the unit encrypted at
+/// its key position plus one block, and the MAC.
+fn video_datagram(crypt: &GkCrypt, packet_index: u16, frame_index: u16, unit: usize, total: usize, unit_data: &[u8]) -> Vec<u8> {
+    let key_pos = 0x1000 + 0x100 * u32::from(packet_index);
+    let mut d = vec![0x02u8];
+    d.extend_from_slice(&packet_index.to_be_bytes());
+    d.extend_from_slice(&frame_index.to_be_bytes());
+    let units = ((unit as u32) << 21) | (((total - 1) as u32) << 10) | 1;
+    d.extend_from_slice(&units.to_be_bytes());
+    d.push(6); // codec
+    d.extend_from_slice(&[0; 4]); // MAC
+    d.extend_from_slice(&key_pos.to_be_bytes());
+    d.extend_from_slice(&[0, 0, 0]); // word_at_0x18, then the adaptive stream index (0) in the top bits
+    d.extend(crypt.crypt(u64::from(key_pos) + 16, unit_data));
+    packet::sign(crypt, &d, key_pos.into()).unwrap()
+}
+
+/// Every video datagram the fake console sends, in order, with one unit of frame 1 left out.
+fn video_datagrams(crypt: &GkCrypt) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut packet_index = 0u16;
+    for (frame_index, len) in [(1u16, FRAME_1), (3, FRAME_3)] {
+        let units = split_frame(&frame_bytes(frame_index, len), UNIT_SIZE, 1).unwrap();
+        for (i, u) in units.iter().enumerate() {
+            if !(frame_index == 1 && i == LOST_UNIT) {
+                out.push(video_datagram(crypt, packet_index, frame_index, i, units.len(), u));
+            }
+            packet_index += 1;
+        }
+    }
+    out
+}
+
 fn fake_console(socket: UdpSocket, q: Quirks) -> std::thread::JoinHandle<Seen> {
     std::thread::spawn(move || {
         socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
@@ -261,15 +309,18 @@ fn fake_console(socket: UdpSocket, q: Quirks) -> std::thread::JoinHandle<Seen> {
             }
             if after_info.len() == 3 && !sent_extras {
                 sent_extras = true;
-                // A video datagram, then a disconnect of our own.
-                let mut video = vec![0x02u8];
-                video.extend_from_slice(&[0; 0x20]);
+                // The video, then a disconnect of our own once the client has had time to skip the lost
+                // packet (chiaki-ng waits 16 ms for it).
+                let video = video_datagrams(&GkCrypt::new(3, &hk, &secret));
                 if q.forged_video {
-                    let mut forged = packet::sign(&GkCrypt::new(3, &hk, &secret), &video, 0).unwrap();
+                    let mut forged = video[0].clone();
                     forged[0xa] ^= 0xff;
                     socket.send(&forged).unwrap();
                 }
-                socket.send(&packet::sign(&GkCrypt::new(3, &hk, &secret), &video, 0).unwrap()).unwrap();
+                for d in &video {
+                    socket.send(d).unwrap();
+                }
+                std::thread::sleep(Duration::from_millis(200));
                 let bye = TakionMessage {
                     r#type: PayloadType::Disconnect as i32,
                     disconnect_payload: Some(psr_proto::DisconnectPayload { reason: "Server shutting down".into(), extended_info: None }),
@@ -298,10 +349,18 @@ fn run_against_fake_console(q: Quirks) {
         assert!(std::time::Instant::now() < deadline, "no disconnect from the fake console; got {events:?}");
         events.extend(s.poll(Duration::from_millis(200)).unwrap());
     }
-    assert!(matches!(&events[0], StreamEvent::Av { video: true, .. }), "{events:?}");
-    assert_eq!(events.iter().filter(|e| matches!(e, StreamEvent::Av { .. })).count(), 1, "the forged one is not passed on");
+    let video: Vec<&VideoEvent> = events.iter().filter_map(|e| if let StreamEvent::Video(v) = e { Some(v) } else { None }).collect();
+    assert_eq!(video.len(), 4, "{video:?}");
+    assert_eq!(*video[0], VideoEvent::Header { profile: 0, data: vec![0, 0, 0, 1, 0x67] });
+    let VideoEvent::Frame(f1) = video[1] else { panic!("{video:?}") };
+    assert_eq!((f1.index, f1.fec_recovered), (1, true), "unit {LOST_UNIT} came back through FEC");
+    assert_eq!(f1.data, frame_bytes(1, FRAME_1));
+    assert_eq!(*video[2], VideoEvent::CorruptFrames { start: 2, end: 2 });
+    let VideoEvent::Frame(f3) = video[3] else { panic!("{video:?}") };
+    assert_eq!((f3.index, f3.fec_recovered, &f3.data), (3, false, &frame_bytes(3, FRAME_3)));
     assert_eq!(events.last(), Some(&StreamEvent::Disconnected("Server shutting down".into())));
-    assert_eq!(s.dropped(), u64::from(q.forged_video));
+    assert_eq!(s.dropped(), u64::from(q.forged_video), "only the forged datagram is dropped");
+    s.request_keyframe().unwrap();
     s.disconnect().unwrap();
 
     let seen = console.join().unwrap();
@@ -310,13 +369,19 @@ fn run_against_fake_console(q: Quirks) {
     assert_eq!(seen.big.encrypted_key, [0; 4]);
     let kinds: Vec<(u16, i32)> = seen.after_info.iter().map(|(c, m)| (*c, m.r#type)).collect();
     assert_eq!(
-        kinds,
+        kinds[..3],
         [
             (9, PayloadType::Streaminfoack as i32),
             (1, PayloadType::Controllerconnection as i32),
             (1, PayloadType::Streaminfo as i32),
         ]
     );
+    // After those: the heartbeat if a second passed, then on channel 2 the report of frame 2 and the
+    // keyframe request.
+    let feedback: Vec<&TakionMessage> = seen.after_info[3..].iter().filter(|(c, _)| *c == 2).map(|(_, m)| m).collect();
+    assert_eq!(feedback.len(), 2, "{:?}", seen.after_info);
+    assert_eq!(feedback[0].corrupt_payload.map(|c| (c.start, c.end)), Some((2, 2)));
+    assert_eq!(feedback[1].r#type, PayloadType::Idrrequest as i32);
     let mic = seen.after_info[2].1.stream_info_payload.as_ref().unwrap();
     assert_eq!(mic.audio_header, stream::microphone_audio_header());
     assert_eq!(seen.disconnect_reason, "Client Disconnecting");

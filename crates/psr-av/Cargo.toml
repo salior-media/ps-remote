@@ -1,0 +1,15 @@
+[package]
+name = "psr-av"
+version = "0.1.0"
+description = "Rebuilds whole video frames from Remote Play's video packets, recovering lost ones with FEC. No decoding. Ported from chiaki-ng."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+psr-fec = { path = "../psr-fec" }
+psr-takion = { path = "../psr-takion" }
+thiserror = "=2.0.21"
+
+[lints]
+workspace = true
