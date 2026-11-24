@@ -1641,6 +1641,7 @@ dependencies = [
  "psr-crypto",
  "psr-input",
  "psr-lan",
+ "psr-psn",
  "serde",
  "serde_json",
  "str0m",
@@ -1708,6 +1709,20 @@ dependencies = [
  "prost",
  "prost-build",
  "protox",
+]
+
+[[package]]
+name = "psr-psn"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "getrandom 0.4.3",
+ "psr-lan",
+ "serde_json",
+ "thiserror",
+ "ureq",
+ "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
