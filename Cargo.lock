@@ -1059,7 +1059,10 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "getrandom 0.4.3",
+ "prost",
  "psr-crypto",
+ "psr-proto",
+ "psr-takion",
  "serde_json",
  "thiserror",
  "ureq",

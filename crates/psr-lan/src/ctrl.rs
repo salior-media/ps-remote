@@ -69,6 +69,11 @@ impl CtrlCipher {
         Self { crypt, local: 0, remote: 0 }
     }
 
+    /// The session's auth cipher, which chiaki-ng also uses for the launch spec.
+    pub fn crypt(&self) -> &RpCrypt {
+        &self.crypt
+    }
+
     pub fn local(&self) -> u64 {
         self.local
     }

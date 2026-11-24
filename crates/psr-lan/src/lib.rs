@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Remote Play on the home network. Ported from chiaki-ng: discovery and wake-up (`discovery.c`), the
-//! console's HTTP dialect (`http.c`), registration (`regist.c`), and the start of a session (`session.c`,
-//! `ctrl.c`).
+//! console's HTTP dialect (`http.c`), registration (`regist.c`), the start of a session (`session.c`,
+//! `ctrl.c`) and the stream connection (`streamconnection.c`).
 
 pub mod ctrl;
 pub mod discovery;
@@ -9,6 +9,7 @@ pub mod http;
 pub mod regist;
 pub mod session;
 pub mod store;
+pub mod stream;
 
 use psr_crypto::{CryptoError, Target};
 
@@ -54,6 +55,14 @@ pub enum LanError {
     CtrlClosed,
     #[error("the console asks for the PSN user's login passcode, which ps-remote does not send yet")]
     LoginPinRequired,
+    #[error("the console's BANG was refused: {0}")]
+    Bang(String),
+    #[error("the console's stream info is invalid: {0}")]
+    StreamInfo(&'static str),
+    #[error("the console ended the stream: {0:?}")]
+    StreamDisconnected(String),
+    #[error(transparent)]
+    Takion(#[from] psr_takion::TakionError),
     #[error(transparent)]
     Crypto(#[from] CryptoError),
 }
