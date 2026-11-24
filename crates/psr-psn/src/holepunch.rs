@@ -188,14 +188,21 @@ pub enum CandidateKind {
 }
 
 /// An address a side can perhaps be reached at (chiaki-ng `Candidate`). `addr` is checked to be one a probe may
-/// be sent to; `addr_mapped` is often `0.0.0.0` (none) and is only read, never sent to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// be sent to; `addr_mapped` is often `0.0.0.0` (none) and is only read, never sent to. Its `Debug` shows only
+/// the kind, so no address reaches a log.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Candidate {
     pub kind: CandidateKind,
     pub addr: IpAddr,
     pub addr_mapped: IpAddr,
     pub port: u16,
     pub port_mapped: u16,
+}
+
+impl std::fmt::Debug for Candidate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Candidate").field("kind", &self.kind).finish_non_exhaustive()
+    }
 }
 
 /// chiaki-ng `ConnectionRequest`.

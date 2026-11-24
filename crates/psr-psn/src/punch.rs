@@ -19,7 +19,15 @@
 //! - **A new address must be at an offered IP.** chiaki-ng takes an address the console did not offer, when a
 //!   datagram comes from it, as a DERIVED candidate, and sends it our request, whose ID is all a response needs;
 //!   so anyone who learns our port could answer in the console's place. Here a DERIVED candidate must share an
-//!   IP address with one the console offered (its NAT showing another port); others are passed over.
+//!   IP address with one the console offered (its NAT showing another port), and only a request of the
+//!   console's makes one; others are passed over.
+//! - **A response must carry our hashed ID.** chiaki-ng takes any response with our 5-byte request ID. The
+//!   console's carries our 20-byte hashed ID at 0x24, where our request carries its own (every live run,
+//!   2026-11-25), so here that is required too: someone who saw only the request ID cannot answer.
+//! - **Deadlines are absolute.** chiaki-ng's waits restart with every datagram that arrives, so a stream of junk
+//!   could hold the exchange open; here the candidate check ends after [`SELECT_TRIES`] resends' time, and the
+//!   answering after the hole after twice [`ANSWER_TIMEOUT`], whatever arrives. A reply that cannot be sent to
+//!   one candidate does not end the exchange.
 //! - **The exchange after the hole is bounded.** chiaki-ng answers the console's requests until a second passes
 //!   with none; here that also stops after [`ANSWER_MAX`] requests, so a sender cannot keep it going.
 
@@ -220,14 +228,13 @@ pub fn mapped(selected: &Candidate, ours: &[Candidate; 2]) -> Candidate {
 
 const ALL_ACTIONS: &[Action] = &[Action::Offer, Action::Accept, Action::Result, Action::Unknown];
 
-/// What [`check_candidates`] found.
-#[derive(Debug)]
+/// What [`check_candidates`] found. Its `Debug` leaves out the addresses.
 pub struct Found {
     /// The console's candidate that answered: one it offered, or one it answered from ([`CandidateKind::Derived`]).
     pub candidate: Candidate,
     pub addr: SocketAddrV4,
-    /// Whether the answer carried the console's hashed ID then ours, where our requests carry ours then the
-    /// console's. Recorded, not required: chiaki-ng does not check it.
+    /// Whether the answer carried the console's hashed ID first, where our requests carry ours. Recorded, not
+    /// required; ours in the second place is required (see the module notes).
     pub ids_mirrored: bool,
 }
 
@@ -264,30 +271,36 @@ pub fn check_candidates(
     if send_all(&targets) == 0 {
         return Err(PsnError::Network("no candidate of the console's could be sent to".into()));
     }
-    sock.set_read_timeout(Some(SELECT_TIMEOUT)).map_err(io)?;
-    let (mut tries, mut responded) = (0, false);
+    // One deadline for the whole exchange, and the resends on their own clock: datagrams arriving, junk or not,
+    // never hold either back (the security review's finding: a read timeout alone restarts with each one).
+    let deadline = Instant::now() + SELECT_TIMEOUT * (SELECT_TRIES + 1);
+    let mut next_resend = Instant::now() + SELECT_TIMEOUT;
+    let mut responded = false;
     let mut buf = [0u8; 2048];
     loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(PsnError::Timeout("an answer from the console's candidates"));
+        }
+        if now >= next_resend {
+            send_all(&targets);
+            next_resend += SELECT_TIMEOUT;
+        }
+        let wait = next_resend.min(deadline).saturating_duration_since(now).max(Duration::from_millis(1));
+        sock.set_read_timeout(Some(wait)).map_err(io)?;
         let (n, from) = match sock.recv_from(&mut buf) {
             Ok((n, SocketAddr::V4(from))) => (n, from),
             Ok(_) => continue,
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
-                if tries >= SELECT_TRIES {
-                    return Err(PsnError::Timeout("an answer from the console's candidates"));
-                }
-                tries += 1;
-                send_all(&targets);
-                continue;
-            }
             Err(e) if stun::is_transient(&e) => continue,
             Err(e) => return Err(io(e)),
         };
+        let Ok(packet) = <[u8; PACKET_LEN]>::try_from(&buf[..n]) else { continue };
         let i = match targets.iter().position(|(_, a)| *a == from) {
             Some(i) => i,
             // chiaki-ng: an address the console did not offer becomes a DERIVED candidate, up to three of them.
-            // Here only at an IP address it did offer (see the module notes).
+            // Here only at an IP address it did offer, and only by sending a request (see the module notes).
             None if targets.len() < offered + EXTRA_CANDIDATES
-                && packet_type(&buf[..n]).is_some()
+                && packet_type(&packet) == Some(MSG_REQ)
                 && targets[..offered].iter().any(|(_, a)| a.ip() == from.ip()) =>
             {
                 targets.push((v4(*from.ip(), from.port(), CandidateKind::Derived), from));
@@ -295,19 +308,21 @@ pub fn check_candidates(
             }
             None => continue,
         };
-        let Ok(packet) = <[u8; PACKET_LEN]>::try_from(&buf[..n]) else { continue };
         match packet_type(&packet) {
             Some(MSG_REQ) => {
-                sock.send_to(&response_packet(ours, console, &packet, from), from).map_err(io)?;
-                responded = true;
+                // A reply that cannot go out is not fatal, as a request that cannot is not (chiaki-ng ends here).
+                if sock.send_to(&response_packet(ours, console, &packet, from), from).is_ok() {
+                    responded = true;
+                }
                 if targets[i].0.kind == CandidateKind::Derived {
                     // So the new address gets a request of ours too (chiaki-ng does this once; again is harmless).
                     let _ = sock.send_to(&request, from);
                 }
             }
-            Some(MSG_RESP) if packet[0x4b..0x50] == request_id => {
+            // Our request ID, and our hashed ID where the console puts it (see the module notes).
+            Some(MSG_RESP) if packet[0x4b..0x50] == request_id && packet[0x24..0x38] == ours.hashed_id => {
                 sock.connect(from).map_err(io)?;
-                let ids_mirrored = packet[0x04..0x18] == console.hashed_id && packet[0x24..0x38] == ours.hashed_id;
+                let ids_mirrored = packet[0x04..0x18] == console.hashed_id;
                 return Ok((Found { candidate: targets.swap_remove(i).0, addr: from, ids_mirrored }, responded));
             }
             // A response to someone else's request, or any other type: passed over.
@@ -317,29 +332,37 @@ pub fn check_candidates(
 }
 
 /// chiaki-ng `receive_request_send_response_ps`: on the connected socket, the console's requests are answered
-/// until [`ANSWER_TIMEOUT`] passes with none (or [`ANSWER_MAX`] are answered). Whether any came.
+/// until [`ANSWER_TIMEOUT`] passes with none, [`ANSWER_MAX`] are answered, or twice [`ANSWER_TIMEOUT`] has
+/// passed in all. Whether any came.
 pub fn answer_requests(sock: &UdpSocket, ours: &Ids, console: &Ids, to: SocketAddrV4) -> Result<bool, PsnError> {
-    sock.set_read_timeout(Some(ANSWER_TIMEOUT)).map_err(io)?;
+    let deadline = Instant::now() + ANSWER_TIMEOUT * 2;
     let (mut answered, mut buf) = (0, [0u8; 2048]);
+    let mut idle_until = Instant::now() + ANSWER_TIMEOUT;
     while answered < ANSWER_MAX {
+        let now = Instant::now();
+        let until = idle_until.min(deadline);
+        if now >= until {
+            break;
+        }
+        sock.set_read_timeout(Some((until - now).max(Duration::from_millis(1)))).map_err(io)?;
         let n = match sock.recv(&mut buf) {
             Ok(n) => n,
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => break,
             Err(e) if stun::is_transient(&e) => continue,
             Err(e) => return Err(io(e)),
         };
         if let Ok(req) = <[u8; PACKET_LEN]>::try_from(&buf[..n])
             && packet_type(&req) == Some(MSG_REQ)
         {
-            sock.send(&response_packet(ours, console, &req, to)).map_err(io)?;
+            // As in `check_candidates`, a reply that cannot go out is not fatal.
+            let _ = sock.send(&response_packet(ours, console, &req, to));
             answered += 1;
+            idle_until = Instant::now() + ANSWER_TIMEOUT;
         }
     }
     Ok(answered > 0)
 }
 
-/// A punched hole: a UDP socket connected to the console.
-#[derive(Debug)]
+/// A punched hole: a UDP socket connected to the console. Its `Debug` leaves out the addresses.
 pub struct Hole {
     pub socket: UdpSocket,
     pub console: SocketAddrV4,
@@ -347,6 +370,24 @@ pub struct Hole {
     pub candidate: Candidate,
     /// See [`Found::ids_mirrored`].
     pub ids_mirrored: bool,
+}
+
+impl std::fmt::Debug for Found {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Found")
+            .field("candidate", &self.candidate)
+            .field("ids_mirrored", &self.ids_mirrored)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for Hole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Hole")
+            .field("candidate", &self.candidate)
+            .field("ids_mirrored", &self.ids_mirrored)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Which hole: chiaki-ng `ChiakiHolepunchPortType`. The control hole comes first.

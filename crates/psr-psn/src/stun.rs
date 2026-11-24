@@ -7,6 +7,8 @@
 //!   at run time; here only its built-in servers are asked, so no third party decides where the probe goes.
 //! - **The reply must come from the server asked.** chiaki-ng takes the first datagram the socket receives;
 //!   here datagrams from any other address are passed over, as are malformed replies, until the timeout.
+//! - **Each name lookup and each send can fail alone.** A server whose name does not resolve within
+//!   [`RESOLVE_TIMEOUT`], or that cannot be sent to, is skipped for the next.
 //! - **IPv4 only, one answer.** chiaki-ng asks up to four servers to measure how the NAT allocates ports, for
 //!   port guessing; that is not ported yet (`docs/PSN.md`, 9b-2b).
 
@@ -88,7 +90,10 @@ fn ipv4_attribute(v: &[u8], xored: bool) -> Option<SocketAddrV4> {
 pub fn ask(sock: &UdpSocket, server: SocketAddrV4) -> Result<Option<SocketAddrV4>, PsnError> {
     let txid: [u8; 12] = crate::holepunch::random()?;
     let io = |e: std::io::Error| PsnError::Network(format!("STUN: {e}"));
-    sock.send_to(&binding_request(&txid), server).map_err(io)?;
+    // A server that cannot be sent to is skipped, not fatal: another may be reachable.
+    if sock.send_to(&binding_request(&txid), server).is_err() {
+        return Ok(None);
+    }
     let deadline = Instant::now() + REPLY_TIMEOUT;
     let mut buf = [0u8; 512];
     loop {
@@ -117,19 +122,32 @@ pub(crate) fn is_transient(e: &std::io::Error) -> bool {
     matches!(e.kind(), WouldBlock | TimedOut | ConnectionReset | Interrupted)
 }
 
-/// Our public address as the first server in [`SERVERS`] to answer sees it, from `sock`, and that server's
-/// address. An error if none answers.
-pub fn external_address(sock: &UdpSocket) -> Result<(SocketAddrV4, SocketAddrV4), PsnError> {
-    for &(host, port) in SERVERS {
-        // A name that does not resolve to IPv4 is skipped, as chiaki-ng skips a server it cannot reach.
-        let Some(server) = (host, port).to_socket_addrs().ok().and_then(|mut a| {
+/// How long a STUN server's name has to resolve. The system resolver has no timeout of its own to set.
+pub const RESOLVE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The first IPv4 address of `host`, looked up on a thread so a stalled resolver costs at most
+/// [`RESOLVE_TIMEOUT`] (the thread is left to finish on its own).
+fn resolve_v4(host: &'static str, port: u16) -> Option<SocketAddrV4> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let found = (host, port).to_socket_addrs().ok().and_then(|mut a| {
             a.find_map(|s| match s {
                 SocketAddr::V4(v4) => Some(v4),
                 SocketAddr::V6(_) => None,
             })
-        }) else {
-            continue;
-        };
+        });
+        // The receiver may have given up already; there is nothing to do then.
+        let _ = tx.send(found);
+    });
+    rx.recv_timeout(RESOLVE_TIMEOUT).ok().flatten()
+}
+
+/// Our public address as the first server in [`SERVERS`] to answer sees it, from `sock`, and that server's
+/// address. An error if none answers.
+pub fn external_address(sock: &UdpSocket) -> Result<(SocketAddrV4, SocketAddrV4), PsnError> {
+    for &(host, port) in SERVERS {
+        // A name that does not resolve to IPv4 in time is skipped, as chiaki-ng skips a server it cannot reach.
+        let Some(server) = resolve_v4(host, port) else { continue };
         if let Some(addr) = ask(sock, server)? {
             return Ok((addr, server));
         }

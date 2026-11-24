@@ -299,3 +299,103 @@ fn an_address_at_an_ip_not_offered_is_passed_over() {
     assert!(!t.join().unwrap(), "the stranger got neither an answer nor our request");
     assert_eq!((found.addr, responded), (offered_addr, false));
 }
+
+#[test]
+fn a_stream_of_junk_neither_holds_the_check_open_nor_stops_the_resends() {
+    let (ours, our_addr) = bind();
+    let (silent, silent_addr) = bind();
+    let stop = Instant::now() + Duration::from_secs(15);
+    let junk = thread::spawn(move || {
+        let (s, _) = bind();
+        while Instant::now() < stop {
+            let _ = s.send_to(b"junk", our_addr);
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+    let counter = thread::spawn(move || {
+        silent.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut b = [0u8; 256];
+        let mut n = 0;
+        while silent.recv_from(&mut b).is_ok() {
+            n += 1;
+        }
+        n
+    });
+    let started = Instant::now();
+    let r = punch::check_candidates(&ours, &OURS, &CONSOLE, &[cand(CandidateKind::Static, "127.0.0.1", silent_addr.port())]);
+    let took = started.elapsed();
+    assert!(matches!(r, Err(psr_psn::PsnError::Timeout(_))), "{r:?}");
+    assert!(took < Duration::from_secs(12), "took {took:?}");
+    assert!(counter.join().unwrap() > punch::SELECT_TRIES as usize / 2, "the resends kept going");
+    junk.join().unwrap();
+}
+
+#[test]
+fn after_the_hole_a_stream_of_other_datagrams_ends_too() {
+    let (ours, _) = bind();
+    let (console, console_addr) = bind();
+    ours.connect(console_addr).unwrap();
+    let our_addr = ours.local_addr().unwrap();
+    let flood = thread::spawn(move || {
+        let not_a_request = punch::response_packet(&CONSOLE, &OURS, &[0; PACKET_LEN], v4("127.0.0.1:1"));
+        let until = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < until {
+            let _ = console.send_to(&not_a_request, our_addr);
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
+    let started = Instant::now();
+    assert!(!punch::answer_requests(&ours, &OURS, &CONSOLE, console_addr).unwrap());
+    assert!(started.elapsed() < punch::ANSWER_TIMEOUT * 2 + Duration::from_millis(500));
+    flood.join().unwrap();
+}
+
+#[test]
+fn only_a_request_makes_a_derived_candidate() {
+    let (ours, our_addr) = bind();
+    let (offered_sock, offered_addr) = bind();
+    let (other, _) = bind();
+    other.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+    let t = thread::spawn(move || {
+        let (req, _) = recv(&offered_sock);
+        // A response-shaped datagram from a new port at the console's IP: not a request, so nothing back.
+        other.send_to(&console_response(&[0; PACKET_LEN]), our_addr).unwrap();
+        let mut b = [0u8; 256];
+        let heard = other.recv_from(&mut b).is_ok();
+        offered_sock.send_to(&console_response(&req), our_addr).unwrap();
+        heard
+    });
+    let (found, _) =
+        punch::check_candidates(&ours, &OURS, &CONSOLE, &[cand(CandidateKind::Static, "127.0.0.1", offered_addr.port())]).unwrap();
+    assert!(!t.join().unwrap());
+    assert_eq!(found.candidate.kind, CandidateKind::Static);
+}
+
+#[test]
+fn a_response_must_carry_our_hashed_id() {
+    let (ours, our_addr) = bind();
+    let (console, console_addr) = bind();
+    let t = thread::spawn(move || {
+        let (req, _) = recv(&console);
+        // The right request ID, but not our hashed ID: someone who saw only the request.
+        let mut forged = console_response(&req);
+        forged[0x24..0x38].fill(0x99);
+        console.send_to(&forged, our_addr).unwrap();
+        thread::sleep(Duration::from_millis(200));
+        let mut real = console_response(&req);
+        real[0x04..0x18].fill(0x77); // the console's own ID need not match what we were told
+        console.send_to(&real, our_addr).unwrap();
+    });
+    let (found, _) =
+        punch::check_candidates(&ours, &OURS, &CONSOLE, &[cand(CandidateKind::Local, "127.0.0.1", console_addr.port())]).unwrap();
+    t.join().unwrap();
+    assert!(!found.ids_mirrored, "the second, real answer was the one taken");
+}
+
+#[test]
+fn debug_output_leaves_out_addresses() {
+    let c = cand(CandidateKind::Static, "203.0.113.77", 9296);
+    let shown = format!("{c:?}");
+    assert!(!shown.contains("203.0.113.77") && !shown.contains("9296"), "{shown}");
+    assert!(shown.contains("Static"));
+}
