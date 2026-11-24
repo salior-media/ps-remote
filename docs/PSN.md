@@ -98,6 +98,20 @@ before the real cause was found; whether Sony also accepts `+` was not tested.
 2. About 6 s later its first offer arrived: request 1, NAT type 2, with two candidates, one `STATIC` and one
    `LOCAL`.
 3. Our acknowledgment was accepted, and the session was left cleanly.
+4. After the security review's fixes (below) the run was repeated with the same result: joined at 20.7 s, offer
+   at 26.8 s.
+
+**What the security review of 9b-2a changed:**
+- Only the console's messages are read. A session message counts only if its `sessionId` is this session and its
+  sender (`customProperties.from.deviceUniqueId`) is the console asked for; anything else is passed over, so
+  another member can neither feed in an offer nor end the wait with a `TERMINATE` or junk. The join is checked the
+  same way, against any entry of `members`, not just the first. The sender is what Sony relays and cannot be
+  checked independently; the console's keys authenticate it later, in the registration.
+- Candidate addresses are typed IP addresses, never names to resolve, and a probe may not go to an unspecified,
+  loopback, multicast or broadcast address, or to port 0. At most 16 candidates are read.
+- `skey` must be exactly 16 bytes and `localHashedId` exactly 20, chiaki-ng's sizes.
+- The session ID is checked before it goes into the start command's JSON, and the `localPeerAddr` repair applies
+  only where the value is truly missing, whitespace included.
 
 **Three findings from verifying 9b-1 (2026-11-25):**
 
