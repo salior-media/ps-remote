@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Remote Play on the home network. Ported from chiaki-ng: discovery and wake-up (`discovery.c`), the
-//! console's HTTP dialect (`http.c`) and registration (`regist.c`). Session start follows in step 6 of
-//! `docs/PORT-MAP.md`.
+//! console's HTTP dialect (`http.c`), registration (`regist.c`), and the start of a session (`session.c`,
+//! `ctrl.c`).
 
+pub mod ctrl;
 pub mod discovery;
 pub mod http;
 pub mod regist;
+pub mod session;
 pub mod store;
 
 use psr_crypto::{CryptoError, Target};
+
+use crate::session::reason_text;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LanError {
@@ -38,6 +42,18 @@ pub enum LanError {
     Random(String),
     #[error("saved console file is invalid: {0}")]
     BadStore(&'static str),
+    #[error("the console refused the session (HTTP {code}): {}", reason_text(*reason))]
+    SessionRefused { code: u16, reason: Option<u32>, rp_version: Option<String> },
+    #[error("the console's session nonce is not 16 bytes of base64")]
+    BadNonce,
+    #[error("the console refused the ctrl connection (HTTP {0})")]
+    CtrlRefused(u16),
+    #[error("the console sent a ctrl message larger than 512 bytes")]
+    CtrlOverflow,
+    #[error("the console closed the ctrl connection")]
+    CtrlClosed,
+    #[error("the console asks for the PSN user's login passcode, which ps-remote does not send yet")]
+    LoginPinRequired,
     #[error(transparent)]
     Crypto(#[from] CryptoError),
 }
