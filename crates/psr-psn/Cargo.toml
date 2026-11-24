@@ -14,7 +14,7 @@ psr-lan = { path = "../psr-lan" }
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 serde_json = "=1.0.152"
 thiserror = "=2.0.21"
-tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }
+tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }
 ureq = { version = "=3.5.0", features = ["json"] }
 url = "=2.5.8"
 webpki-roots = "=1.0.12"

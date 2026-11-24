@@ -80,11 +80,11 @@ fn notification_kinds_are_chiaki_ngs() {
 
 #[test]
 fn the_upgrade_request_has_chiaki_ngs_headers_spelled_as_curl_sends_them() {
-    let req = push::upgrade_request("h.example", "TOKEN", "KEY==");
+    let req = push::upgrade_request(HOST, "TOKEN", "KEY==").unwrap();
     assert!(req.starts_with("GET /np/pushNotification HTTP/1.1\r\n"));
     assert!(req.ends_with("\r\n\r\n"));
     for line in [
-        "Host: h.example",
+        &format!("Host: {HOST}")[..],
         "Upgrade: websocket",
         "Connection: Upgrade",
         "Sec-WebSocket-Version: 13",
@@ -121,12 +121,74 @@ fn the_upgrade_response_must_accept_our_key() {
 }
 
 #[test]
-fn the_push_server_name_is_a_host_name_only() {
+fn the_push_server_name_is_one_of_sonys() {
+    // The bearer token goes to this host: Sony's own push domain only, and a well-formed name.
     assert!(push::valid_fqdn(HOST));
-    for bad in ["", "a b", "evil.example/x", "evil.example:1", "h\r\nX-Injected: 1", "évil.example"] {
+    for bad in [
+        "",
+        "a b",
+        "evil.example",
+        "evil.example.com",
+        "1.2.3.4",
+        "np.communication.playstation.net",
+        "x.np.communication.playstation.net.evil.example",
+        "a..np.communication.playstation.net",
+        "-a.np.communication.playstation.net",
+        "a-.np.communication.playstation.net",
+        "evil.example/x.np.communication.playstation.net",
+        "h\r\nX-Injected: 1.np.communication.playstation.net",
+        "évil.np.communication.playstation.net",
+    ] {
         assert!(!push::valid_fqdn(bad), "{bad:?}");
     }
-    assert!(!push::valid_fqdn(&"a".repeat(254)));
+    assert!(!push::valid_fqdn(&format!("{}.np.communication.playstation.net", "a".repeat(64))), "a label over 63");
+}
+
+#[test]
+fn nothing_unchecked_reaches_the_upgrade_request() {
+    assert!(push::upgrade_request("evil.example", "T", "K==").is_err(), "a host outside Sony's");
+    for token in ["t\r\nEvil: 1", "t ok", "", "t\u{7f}"] {
+        assert!(push::upgrade_request(HOST, token, "K==").is_err(), "{token:?}");
+    }
+    assert!(push::upgrade_request(HOST, "T", "K\r\nX: y").is_err(), "the key");
+}
+
+#[test]
+fn a_session_id_is_checked_before_it_goes_into_a_url() {
+    assert!(rps::valid_session_id("1b2c3d4e-0000-4000-8000-123456789abc"));
+    for bad in ["../../x", "1b2c3d4e-0000-4000-8000-123456789ab?", "", "1b2c3d4e-0000-4000-8000-123456789abc0"] {
+        assert!(!rps::valid_session_id(bad), "{bad:?}");
+        assert!(matches!(rps::leave("token", bad), Err(PsnError::BadField("sessionId"))), "{bad:?}");
+    }
+}
+
+#[test]
+fn reads_stop_at_the_deadline_however_slowly_the_bytes_come() {
+    use std::io::Read;
+    use std::time::Instant;
+    /// One byte per read, for ever: a server dribbling a frame.
+    struct Trickle;
+    impl Read for Trickle {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            buf[0] = b'x';
+            Ok(1)
+        }
+    }
+    let mut s = push::Deadline::new(Trickle);
+    let mut b = [0u8; 4];
+    assert_eq!(s.read(&mut b).unwrap(), 1, "no deadline: reads go through");
+    s.set_deadline(Some(Instant::now() + Duration::from_secs(60)));
+    assert_eq!(s.read(&mut b).unwrap(), 1);
+    s.set_deadline(Some(Instant::now() - Duration::from_millis(1)));
+    let e = s.read(&mut b).unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::TimedOut, "past the deadline the stream stops, bytes or not");
+}
+
+#[test]
+fn the_online_id_is_cleaned_and_capped() {
+    assert_eq!(rps::clean_online_id("Player_1"), "Player_1");
+    assert_eq!(rps::clean_online_id("a\u{1b}[2Jb"), "a?[2Jb");
+    assert_eq!(rps::clean_online_id(&"x".repeat(500)).len(), rps::ONLINE_ID_MAX);
 }
 
 #[test]

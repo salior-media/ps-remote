@@ -41,7 +41,7 @@ pub struct Created {
 pub fn parse_created(json: &serde_json::Value) -> Result<Created, PsnError> {
     let s = &json["remotePlaySessions"][0];
     let session_id = s["sessionId"].as_str().ok_or(PsnError::MissingField("sessionId"))?;
-    if session_id.len() != 36 || !session_id.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+    if !valid_session_id(session_id) {
         return Err(PsnError::BadField("sessionId"));
     }
     let account = &s["members"][0]["accountId"];
@@ -51,6 +51,20 @@ pub fn parse_created(json: &serde_json::Value) -> Result<Created, PsnError> {
         _ => return Err(PsnError::MissingField("accountId")),
     };
     Ok(Created { session_id: session_id.to_string(), account_id })
+}
+
+/// A session ID as chiaki-ng accepts one: 36 characters of hex digits and hyphens (a UUID). It goes into a URL
+/// path, so nothing else is let through.
+pub fn valid_session_id(id: &str) -> bool {
+    id.len() == 36 && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+}
+
+/// Online IDs are 3 to 16 characters; anything past this is not one.
+pub const ONLINE_ID_MAX: usize = 32;
+
+/// The online ID from Sony's notification, made safe to print and capped (it is Sony's text).
+pub fn clean_online_id(id: &str) -> String {
+    crate::printable(id).chars().take(ONLINE_ID_MAX).collect()
 }
 
 /// A random UUID, version 4 (chiaki-ng `random_uuidv4`), for the push context.
@@ -89,7 +103,7 @@ pub fn create(access_token: &str, push: &mut Push) -> Result<Session, PsnError> 
         match n.kind {
             Kind::SessionCreated => {
                 let id = n.json.pointer("/to/onlineId").and_then(|v| v.as_str());
-                online_id = Some(id.ok_or(PsnError::MissingField("to.onlineId"))?.to_string());
+                online_id = Some(clean_online_id(id.ok_or(PsnError::MissingField("to.onlineId"))?));
             }
             Kind::MemberCreated => joined = true,
             // chiaki-ng refuses anything else at this point; a notification for another session or an older
@@ -102,6 +116,9 @@ pub fn create(access_token: &str, push: &mut Push) -> Result<Session, PsnError> 
 
 /// chiaki-ng `deleteSession`: leaves the session, which ends it.
 pub fn leave(access_token: &str, session_id: &str) -> Result<(), PsnError> {
+    if !valid_session_id(session_id) {
+        return Err(PsnError::BadField("sessionId"));
+    }
     let url = format!("{SESSION_CREATE_URL}/{session_id}/members/me");
     let sent = crate::agent()
         .delete(&url)

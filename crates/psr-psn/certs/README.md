@@ -11,3 +11,7 @@ without this intermediate. Browsers and chiaki-ng fetch it through AIA; rustls d
 it to rustls's own verifier beside the server's chain. It is not trusted by itself: rustls still checks it
 up to the public root in `webpki-roots`, and checks the signatures, dates and host name, so a wrong or
 altered file fails verification just as a missing one does. `tests/push.rs` pins its fingerprint.
+
+**It expires on 2029-02-11.** After that the push connection fails closed (rustls refuses the chain), and
+this file needs replacing with the intermediate the server's certificate then names. Like chiaki-ng, and like
+rustls by default, nothing checks revocation (CRL or OCSP).

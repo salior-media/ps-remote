@@ -93,9 +93,22 @@ pub fn fqdn(access_token: &str) -> Result<String, PsnError> {
     Ok(fqdn.to_string())
 }
 
-/// A host name and nothing else (letters, digits, dots and hyphens): it goes into a URL and a request line.
+/// Sony's push domain. The bearer token is sent to the push server, so the name Sony's lookup returns must be
+/// in it: TLS checks a certificate against the name asked for, and would not stop a lookup that named another
+/// host with a certificate of its own.
+pub const PUSH_DOMAIN: &str = ".np.communication.playstation.net";
+
+/// A well-formed host name under [`PUSH_DOMAIN`]: labels of 1 to 63 letters, digits and hyphens, none starting or
+/// ending with a hyphen, 253 characters at most. It goes into a request line and a TLS name.
 pub fn valid_fqdn(fqdn: &str) -> bool {
-    !fqdn.is_empty() && fqdn.len() <= 253 && fqdn.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    let label_ok = |l: &str| {
+        (1..=63).contains(&l.len())
+            && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+    };
+    fqdn.len() <= 253
+        && fqdn.strip_suffix(PUSH_DOMAIN).is_some_and(|host| !host.is_empty() && host.split('.').all(label_ok))
 }
 
 /// rustls's WebPKI verifier, offered [`PUSH_INTERMEDIATE`] beside the chain the server sends.
@@ -171,13 +184,60 @@ pub fn tls_config() -> Result<Arc<rustls::ClientConfig>, PsnError> {
     Ok(Arc::new(config))
 }
 
-type Tls = StreamOwned<ClientConnection, TcpStream>;
+/// A stream that stops at a deadline: once it has passed, every read and write fails with `TimedOut`, however
+/// the bytes are coming. A socket timeout alone bounds each read, not their sum, so a server sending one byte at
+/// a time could hold a handshake or a half-sent frame for as long as it liked.
+#[derive(Debug)]
+pub struct Deadline<S> {
+    inner: S,
+    deadline: Option<Instant>,
+}
+
+impl<S> Deadline<S> {
+    pub fn new(inner: S) -> Self {
+        Self { inner, deadline: None }
+    }
+
+    pub fn set_deadline(&mut self, deadline: Option<Instant>) {
+        self.deadline = deadline;
+    }
+
+    fn check(&self) -> std::io::Result<()> {
+        match self.deadline {
+            Some(d) if Instant::now() >= d => Err(std::io::ErrorKind::TimedOut.into()),
+            _ => Ok(()),
+        }
+    }
+}
+
+impl<S: Read> Read for Deadline<S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.check()?;
+        self.inner.read(buf)
+    }
+}
+
+impl<S: Write> Write for Deadline<S> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.check()?;
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.check()?;
+        self.inner.flush()
+    }
+}
+
+// The deadline is under TLS, on the socket: rustls may read the socket several times in one read of its own.
+type Tls = StreamOwned<ClientConnection, Deadline<TcpStream>>;
 
 /// An open push connection (chiaki-ng's websocket, without its thread).
 pub struct Push {
     ws: WebSocket<Tls>,
     last_ping: Instant,
-    awaiting_pong: bool,
+    /// The payload of the ping not yet answered: only a pong carrying it counts.
+    awaiting_pong: Option<[u8; 8]>,
 }
 
 impl std::fmt::Debug for Push {
@@ -190,9 +250,24 @@ fn ws_err(e: tungstenite::Error) -> PsnError {
     PsnError::Network(format!("push websocket: {e}"))
 }
 
+/// Visible ASCII only (no space or control character): a token or key that could not end a header line early.
+fn header_safe(v: &str) -> bool {
+    !v.is_empty() && v.bytes().all(|b| (0x21..=0x7e).contains(&b))
+}
+
 /// The upgrade request, with each header name spelled as chiaki-ng (through curl) sends it, written here so
-/// nothing about it is left to a library; tungstenite takes over after the handshake.
-pub fn upgrade_request(fqdn: &str, access_token: &str, key: &str) -> String {
+/// nothing about it is left to a library; tungstenite takes over after the handshake. Every value from outside
+/// is checked, so none can add a header or a second request.
+pub fn upgrade_request(fqdn: &str, access_token: &str, key: &str) -> Result<String, PsnError> {
+    if !valid_fqdn(fqdn) {
+        return Err(PsnError::BadField("fqdn"));
+    }
+    if !header_safe(access_token) {
+        return Err(PsnError::BadField("access token"));
+    }
+    if !header_safe(key) {
+        return Err(PsnError::BadField("Sec-WebSocket-Key"));
+    }
     let headers = [
         ("Host", fqdn),
         ("Upgrade", "websocket"),
@@ -214,7 +289,7 @@ pub fn upgrade_request(fqdn: &str, access_token: &str, key: &str) -> String {
         r.push_str(&format!("{k}: {v}\r\n"));
     }
     r.push_str("\r\n");
-    r
+    Ok(r)
 }
 
 /// The status code and headers of a handshake response, checked: 101 with `Sec-WebSocket-Accept` matching
@@ -243,6 +318,14 @@ pub fn check_upgrade_response(head: &str, key: &str) -> Result<(), PsnError> {
     Ok(())
 }
 
+/// A handshake's I/O error: running out of time is a timeout, anything else a network error.
+fn handshake_io(e: std::io::Error) -> PsnError {
+    match e.kind() {
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => PsnError::Timeout("the push handshake"),
+        _ => PsnError::Network(format!("push websocket handshake: {e}")),
+    }
+}
+
 /// Reads up to and including the blank line that ends a response's head, a byte at a time so nothing after
 /// it is taken from the websocket.
 fn read_head(stream: &mut Tls) -> Result<String, PsnError> {
@@ -252,45 +335,63 @@ fn read_head(stream: &mut Tls) -> Result<String, PsnError> {
         if head.len() >= RESPONSE_HEAD_MAX {
             return Err(PsnError::BadField("push handshake response"));
         }
-        stream.read_exact(&mut byte).map_err(|e| PsnError::Network(format!("push websocket handshake: {e}")))?;
+        stream.read_exact(&mut byte).map_err(handshake_io)?;
         head.push(byte[0]);
     }
     String::from_utf8(head).map_err(|_| PsnError::BadField("push handshake response"))
 }
 
+/// Each of the name's addresses in turn, all within `deadline`.
+fn connect_tcp(fqdn: &str, deadline: Instant) -> Result<TcpStream, PsnError> {
+    let addrs = (fqdn, 443).to_socket_addrs().map_err(|e| PsnError::Network(e.to_string()))?;
+    let mut last = PsnError::Network(format!("{fqdn} has no address"));
+    for addr in addrs {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(PsnError::Timeout("the push server to accept the connection"));
+        }
+        match TcpStream::connect_timeout(&addr, left) {
+            Ok(tcp) => return Ok(tcp),
+            Err(e) => last = PsnError::Network(e.to_string()),
+        }
+    }
+    Err(last)
+}
+
 impl Push {
     /// Connects to `wss://<fqdn>/np/pushNotification` with the headers Sony's app sends (chiaki-ng
-    /// `websocket_thread_func`).
+    /// `websocket_thread_func`). The whole of it, from the address lookup to the handshake's last byte, has
+    /// [`CONNECT_TIMEOUT`].
     pub fn connect(fqdn: &str, access_token: &str) -> Result<Self, PsnError> {
-        let addr = (fqdn, 443)
-            .to_socket_addrs()
-            .map_err(|e| PsnError::Network(e.to_string()))?
-            .next()
-            .ok_or_else(|| PsnError::Network(format!("{fqdn} has no address")))?;
-        let tcp = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).map_err(|e| PsnError::Network(e.to_string()))?;
+        let deadline = Instant::now() + CONNECT_TIMEOUT;
+        let key = tungstenite::handshake::client::generate_key();
+        // Checked before anything is sent.
+        let request = upgrade_request(fqdn, access_token, &key)?;
+        let tcp = connect_tcp(fqdn, deadline)?;
         tcp.set_read_timeout(Some(CONNECT_TIMEOUT)).map_err(PsnError::Io)?;
         tcp.set_write_timeout(Some(CONNECT_TIMEOUT)).map_err(PsnError::Io)?;
         let name = ServerName::try_from(fqdn.to_string()).map_err(|_| PsnError::BadField("fqdn"))?;
         let tls = ClientConnection::new(tls_config()?, name).map_err(|e| PsnError::Network(e.to_string()))?;
-        let mut stream = StreamOwned::new(tls, tcp);
+        let mut stream = StreamOwned::new(tls, Deadline::new(tcp));
+        stream.sock.set_deadline(Some(deadline));
 
-        let key = tungstenite::handshake::client::generate_key();
-        let request = upgrade_request(fqdn, access_token, &key);
-        stream
-            .write_all(request.as_bytes())
-            .map_err(|e| PsnError::Network(format!("push websocket handshake: {e}")))?;
-        stream.flush().map_err(|e| PsnError::Network(format!("push websocket handshake: {e}")))?;
+        stream.write_all(request.as_bytes()).map_err(handshake_io)?;
+        stream.flush().map_err(handshake_io)?;
         check_upgrade_response(&read_head(&mut stream)?, &key)?;
+        stream.sock.set_deadline(None);
 
         let mut config = tungstenite::protocol::WebSocketConfig::default();
         config.max_message_size = Some(MAX_FRAME);
         config.max_frame_size = Some(MAX_FRAME);
         let ws = WebSocket::from_raw_socket(stream, Role::Client, Some(config));
-        Ok(Self { ws, last_ping: Instant::now(), awaiting_pong: false })
+        Ok(Self { ws, last_ping: Instant::now(), awaiting_pong: None })
     }
 
-    fn set_read_timeout(&mut self, d: Duration) -> Result<(), PsnError> {
-        self.ws.get_mut().sock.set_read_timeout(Some(d.max(Duration::from_millis(1)))).map_err(PsnError::Io)
+    /// The socket timeout for one read, and the stream's deadline for the whole of [`Push::next`]'s wait.
+    fn bound_reads(&mut self, timeout: Duration, deadline: Instant) -> Result<(), PsnError> {
+        let stream = self.ws.get_mut();
+        stream.sock.set_deadline(Some(deadline));
+        stream.sock.inner.set_read_timeout(Some(timeout.max(Duration::from_millis(1)))).map_err(PsnError::Io)
     }
 
     /// The next notification before `deadline`, keeping the connection alive with a ping every five
@@ -299,19 +400,24 @@ impl Push {
     pub fn next(&mut self, deadline: Instant) -> Result<Option<Notification>, PsnError> {
         loop {
             let now = Instant::now();
-            if self.awaiting_pong && now.duration_since(self.last_ping) > PING_INTERVAL {
+            if self.awaiting_pong.is_some() && now.duration_since(self.last_ping) > PING_INTERVAL {
                 return Err(PsnError::Network("the push server stopped answering pings".into()));
             }
             if now.duration_since(self.last_ping) >= PING_INTERVAL {
-                self.ws.send(Message::Ping(Vec::new().into())).map_err(ws_err)?;
+                let mut payload = [0u8; 8];
+                getrandom::fill(&mut payload).map_err(|e| PsnError::Network(format!("random numbers: {e}")))?;
+                // No deadline on the stream while sending: it is for reads.
+                self.ws.get_mut().sock.set_deadline(None);
+                self.ws.send(Message::Ping(payload.to_vec().into())).map_err(ws_err)?;
                 self.last_ping = now;
-                self.awaiting_pong = true;
+                self.awaiting_pong = Some(payload);
             }
             if now >= deadline {
                 return Ok(None);
             }
-            let until_ping = (self.last_ping + PING_INTERVAL).saturating_duration_since(now);
-            self.set_read_timeout(until_ping.min(deadline - now))?;
+            // Wake for the next ping, or the caller's deadline, whichever is first, however slowly a frame arrives.
+            let wake = (self.last_ping + PING_INTERVAL).min(deadline);
+            self.bound_reads(wake - now, wake)?;
             match self.ws.read() {
                 Ok(Message::Text(t)) => {
                     if let Some(n) = Notification::parse(t.as_bytes()) {
@@ -325,7 +431,12 @@ impl Push {
                 }
                 // tungstenite answers pings itself.
                 Ok(Message::Ping(_) | Message::Frame(_)) => {}
-                Ok(Message::Pong(_)) => self.awaiting_pong = false,
+                // Only the answer to our own ping: an unasked pong does not prove the server is listening.
+                Ok(Message::Pong(p)) => {
+                    if self.awaiting_pong.is_some_and(|want| p.as_ref() == want) {
+                        self.awaiting_pong = None;
+                    }
+                }
                 Ok(Message::Close(_)) => return Err(PsnError::Network("the push server closed the connection".into())),
                 Err(tungstenite::Error::Io(e))
                     if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
@@ -336,6 +447,7 @@ impl Push {
 
     /// Closes the connection politely; errors are ignored, as the connection is being dropped anyway.
     pub fn close(mut self) {
+        self.ws.get_mut().sock.set_deadline(Some(Instant::now() + PING_INTERVAL));
         let _ = self.ws.close(None);
         let _ = self.ws.flush();
     }
