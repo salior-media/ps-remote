@@ -15,8 +15,15 @@ use serde_json::json;
 const CHIAKI_LOGIN_URL: &str = "https://auth.api.sonyentertainmentnetwork.com/2.0/oauth/authorize?service_entity=urn:service-entity:psn&response_type=code&client_id=%1&redirect_uri=https://remoteplay.dl.playstation.net/remoteplay/redirect&scope=psn:clientapp referenceDataService:countryConfig.read pushNotification:webSocket.desktop.connect sessionManager:remotePlaySession.system.update&request_locale=en_US&ui=pr&service_logo=ps&layout_type=popup&smcid=remoteplay&prompt=always&PlatformPrivacyWs1=minimal&";
 
 #[test]
-fn the_sign_in_page_is_chiaki_ngs() {
-    assert_eq!(auth::login_url(), CHIAKI_LOGIN_URL.replace("%1", CLIENT_ID));
+fn the_sign_in_page_is_chiaki_ngs_with_no_spaces() {
+    // chiaki-ng's web view encodes the spaces between the scopes; a printed address must do it itself, or
+    // copying it from a terminal cuts it at the first space and signs in with one scope only.
+    let url = auth::login_url();
+    assert!(!url.contains(' '), "{url}");
+    assert_eq!(url, CHIAKI_LOGIN_URL.replace("%1", CLIENT_ID).replace(' ', "%20"));
+    let parsed = url::Url::parse(&url).unwrap();
+    let scope = parsed.query_pairs().find(|(k, _)| k == "scope").unwrap().1.into_owned();
+    assert_eq!(scope, SCOPE, "Sony reads all four scopes");
 }
 
 #[test]
@@ -183,4 +190,15 @@ fn save_load_and_forget() {
     secret::forget(&dir).unwrap();
     assert_eq!(secret::load_refresh_token(&dir).unwrap(), None);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn spaces_are_sent_as_percent_20_and_plus_signs_survive() {
+    // Sony's token service reads '+' literally: the scopes must be joined by %20.
+    let body = auth::refresh_request("a+b c");
+    assert!(!body.contains('+'), "{body}");
+    assert!(body.contains("scope=psn%3Aclientapp%20referenceDataService"), "{body}");
+    let f = fields(&body);
+    assert_eq!(f[1], ("refresh_token".to_string(), "a+b c".to_string()), "a real '+' in a value stays one");
+    assert_eq!(f[2].1, SCOPE);
 }

@@ -26,10 +26,15 @@ pub const SCOPE: &str = "psn:clientapp referenceDataService:countryConfig.read p
 /// chiaki-ng's timeout for each PSN request.
 pub const TIMEOUT: Duration = Duration::from_secs(5);
 
-/// chiaki-ng `PSNAuth::LOGIN_URL`: Sony's sign-in page for the Remote Play app.
+/// chiaki-ng `PSNAuth::LOGIN_URL`: Sony's sign-in page for the Remote Play app, with the spaces between the
+/// scopes written as `%20`. chiaki-ng opens its address in its own web view, which encodes them; this one is
+/// printed for the person to open, and an address copied from a terminal stops at its first space, which
+/// signs in with `psn:clientapp` alone. Every later refresh asking for the four scopes is then refused as
+/// `invalid_scope` (seen 2026-11-25).
 pub fn login_url() -> String {
+    let scope = SCOPE.replace(' ', "%20");
     format!(
-        "https://auth.api.sonyentertainmentnetwork.com/2.0/oauth/authorize?service_entity=urn:service-entity:psn&response_type=code&client_id={CLIENT_ID}&redirect_uri={REDIRECT_URI}&scope={SCOPE}&request_locale=en_US&ui=pr&service_logo=ps&layout_type=popup&smcid=remoteplay&prompt=always&PlatformPrivacyWs1=minimal&"
+        "https://auth.api.sonyentertainmentnetwork.com/2.0/oauth/authorize?service_entity=urn:service-entity:psn&response_type=code&client_id={CLIENT_ID}&redirect_uri={REDIRECT_URI}&scope={scope}&request_locale=en_US&ui=pr&service_logo=ps&layout_type=popup&smcid=remoteplay&prompt=always&PlatformPrivacyWs1=minimal&"
     )
 }
 
@@ -48,8 +53,11 @@ pub fn code_from_redirect(address: &str) -> Result<String, PsnError> {
         .ok_or(PsnError::NoCode)
 }
 
+/// A form body with each value percent-encoded. Spaces are sent as `%20`, not the form encoding's `+`: Sony's
+/// token service reads `+` literally, and a refresh with the scopes joined by `+` is refused as
+/// `invalid_scope`. (Every `+` in a value is `%2B` by then, so each `+` left is a space.)
 fn form(pairs: &[(&str, &str)]) -> String {
-    url::form_urlencoded::Serializer::new(String::new()).extend_pairs(pairs).finish()
+    url::form_urlencoded::Serializer::new(String::new()).extend_pairs(pairs).finish().replace('+', "%20")
 }
 
 /// The body that trades a sign-in code for tokens (chiaki-ng `PSNToken::InitPsnToken`). Each value is
@@ -102,24 +110,21 @@ pub fn parse_tokens(json: &serde_json::Value, now: SystemTime) -> Result<Tokens,
     })
 }
 
-fn post_token(secret: &str, body: String) -> Result<Tokens, PsnError> {
-    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(TIMEOUT)).build().into();
-    let mut r = agent
+fn post_token(what: &'static str, secret: &str, body: String) -> Result<Tokens, PsnError> {
+    let sent = crate::agent()
         .post(TOKEN_URL)
         .header("Authorization", basic_auth(secret))
         .header("Content-Type", "application/x-www-form-urlencoded")
-        .send(body)
-        .map_err(PsnError::from_ureq)?;
-    let json: serde_json::Value = r.body_mut().read_json().map_err(PsnError::from_ureq)?;
-    parse_tokens(&json, SystemTime::now())
+        .send(body);
+    parse_tokens(&crate::reply(what, sent)?, SystemTime::now())
 }
 
 /// Trades the code from Sony's sign-in for tokens.
 pub fn exchange_code(secret: &str, code: &str) -> Result<Tokens, PsnError> {
-    post_token(secret, code_request(code))
+    post_token("sign-in", secret, code_request(code))
 }
 
 /// A new access token (and refresh token) from the refresh token.
 pub fn refresh(secret: &str, refresh_token: &str) -> Result<Tokens, PsnError> {
-    post_token(secret, refresh_request(refresh_token))
+    post_token("token refresh", secret, refresh_request(refresh_token))
 }

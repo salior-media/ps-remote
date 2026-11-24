@@ -48,6 +48,18 @@ examples. The port map named `reqwest`; `ureq` is the blocking client the rest o
 **Staying unbanned** (scope §7.2): only the endpoints Sony's app calls for the same thing, only when a person asks,
 and nothing polled in the background.
 
+## Found while verifying 9a (2026-11-25)
+
+The first sign-in on the household's account was granted `psn:clientapp` only. Every later refresh asking for the
+four scopes was then refused: `invalid_scope`, Sony's code 4153.
+- **The cause:** the printed sign-in address had spaces between the scopes. An address copied from a terminal stops
+  at its first space, and chiaki-ng never meets this because it opens the address in its own web view.
+- **The diagnosis:** a refresh asking for `psn:clientapp` alone succeeded and reported that single granted scope.
+- **The fix:** the address is printed with `%20`.
+- **The check:** after signing in again, the console list works, and so does a second refresh from the saved token.
+
+Sony's token service also reads `+` in a form body literally, so request bodies send spaces as `%20`.
+
 ## What 9a does not do yet
 
 It doesn't wake a console over PSN, run the holepunch session, or carry any media. Those are 9b and 9c.

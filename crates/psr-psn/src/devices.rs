@@ -3,7 +3,6 @@
 //! `lib/src/remote/holepunch.c` (LicenseRef-AGPL-3.0-only-OpenSSL).
 
 use crate::PsnError;
-use crate::auth::TIMEOUT;
 
 /// chiaki-ng `device_list_url_fmt`, for PS5s (chiaki-ng lists only those).
 pub const DEVICE_LIST_URL: &str = "https://web.np.playstation.com/api/cloudAssistedNavigation/v2/users/me/clients?platform=PS5&includeFields=device&limit=10&offset=0";
@@ -53,14 +52,11 @@ pub fn parse_devices(json: &serde_json::Value) -> Result<Vec<Device>, PsnError> 
 
 /// The account's PS5s, with an access token.
 pub fn list(access_token: &str) -> Result<Vec<Device>, PsnError> {
-    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(TIMEOUT)).build().into();
-    let mut r = agent
+    let sent = crate::agent()
         .get(DEVICE_LIST_URL)
         // chiaki-ng sends this language; the reply's fields are the same in any.
         .header("Accept-Language", "jp")
         .header("Authorization", format!("Bearer {access_token}"))
-        .call()
-        .map_err(PsnError::from_ureq)?;
-    let json: serde_json::Value = r.body_mut().read_json().map_err(PsnError::from_ureq)?;
-    parse_devices(&json)
+        .call();
+    parse_devices(&crate::reply("console list", sent)?)
 }
