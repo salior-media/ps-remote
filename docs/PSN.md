@@ -115,9 +115,24 @@ before the real cause was found; whether Sony also accepts `+` was not tested.
 - **Malformed datagrams are passed over** rather than ending the exchange, and the answering after the hole stops
   after 32 requests.
 - **Our local address is the route's** to the STUN server, not the first wired adapter.
+- **A response must carry our 20-byte hashed ID** at 0x24 as well as our 5-byte request ID; chiaki-ng checks only
+  the request ID. Every live answer carried it.
+- **Every wait in the exchange has an absolute deadline.** chiaki-ng's restart with each datagram that arrives.
+
+**What the security review of 9b-2b changed** (ten findings, all reasoned from the code; eight fixed):
+- **A stream of datagrams could hold the candidate check open forever** (medium): its timeout was per read, so any
+  datagram every half second, junk included, kept it waiting and stopped the resends. The check now has one
+  deadline (twenty resends' time) and resends on its own clock. The answering after the hole has a deadline too.
+- Only a request of the console's makes a DERIVED candidate, and a response must carry our hashed ID.
+- A reply that cannot be sent to one candidate, or a STUN server that cannot be sent to, no longer ends the attempt;
+  a STUN server's name has 3 s to resolve.
+- `Candidate`, `Found` and `Hole` no longer show addresses in `Debug` output.
+- **Left as they are:** the console's candidates may still be private or link-local addresses (a LAN console's
+  `LOCAL` one can be), and a pong is only waited for by reads with at least two seconds to give (every wait here has
+  thirty).
 
 **9b-2b against the household's PS5, on the LAN (2026-11-25):**
-1. The control hole was punched about 10 s after the console joined: the console's `LOCAL` candidate answered our
+1. The control hole was punched about 10 s after the console joined (and again, 10.6 s, after the review's fixes): the console's `LOCAL` candidate answered our
    request, both ACCEPTs went through, and the socket is connected to the console. Its response carried its own
    hashed ID first and ours second, the mirror of our request (recorded, not yet required).
 2. **The console holds its ACCEPT until its own UDP requests on the new hole are answered.** The first port answered

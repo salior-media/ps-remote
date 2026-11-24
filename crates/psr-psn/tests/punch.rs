@@ -322,7 +322,12 @@ fn a_stream_of_junk_neither_holds_the_check_open_nor_stops_the_resends() {
         n
     });
     let started = Instant::now();
-    let r = punch::check_candidates(&ours, &OURS, &CONSOLE, &[cand(CandidateKind::Static, "127.0.0.1", silent_addr.port())]);
+    let r = punch::check_candidates(
+        &ours,
+        &OURS,
+        &CONSOLE,
+        &[cand(CandidateKind::Static, "127.0.0.1", silent_addr.port())],
+    );
     let took = started.elapsed();
     assert!(matches!(r, Err(psr_psn::PsnError::Timeout(_))), "{r:?}");
     assert!(took < Duration::from_secs(12), "took {took:?}");
@@ -331,23 +336,24 @@ fn a_stream_of_junk_neither_holds_the_check_open_nor_stops_the_resends() {
 }
 
 #[test]
-fn after_the_hole_a_stream_of_other_datagrams_ends_too() {
+fn after_the_hole_requests_just_under_the_idle_timeout_do_not_keep_it_going() {
     let (ours, _) = bind();
     let (console, console_addr) = bind();
     ours.connect(console_addr).unwrap();
     let our_addr = ours.local_addr().unwrap();
-    let flood = thread::spawn(move || {
-        let not_a_request = punch::response_packet(&CONSOLE, &OURS, &[0; PACKET_LEN], v4("127.0.0.1:1"));
+    let trickle = thread::spawn(move || {
+        // A request every 300 ms: each resets the idle timeout, and 32 of them would take nearly ten seconds.
+        let req = punch::request_packet(&CONSOLE, &OURS, &[5; 5]);
         let until = Instant::now() + Duration::from_secs(5);
         while Instant::now() < until {
-            let _ = console.send_to(&not_a_request, our_addr);
-            thread::sleep(Duration::from_millis(50));
+            let _ = console.send_to(&req, our_addr);
+            thread::sleep(Duration::from_millis(300));
         }
     });
     let started = Instant::now();
-    assert!(!punch::answer_requests(&ours, &OURS, &CONSOLE, console_addr).unwrap());
-    assert!(started.elapsed() < punch::ANSWER_TIMEOUT * 2 + Duration::from_millis(500));
-    flood.join().unwrap();
+    assert!(punch::answer_requests(&ours, &OURS, &CONSOLE, console_addr).unwrap());
+    assert!(started.elapsed() < punch::ANSWER_TIMEOUT * 2 + Duration::from_millis(500), "{:?}", started.elapsed());
+    trickle.join().unwrap();
 }
 
 #[test]
@@ -355,7 +361,8 @@ fn only_a_request_makes_a_derived_candidate() {
     let (ours, our_addr) = bind();
     let (offered_sock, offered_addr) = bind();
     let (other, _) = bind();
-    other.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+    // Longer than the resend interval: a candidate made from this datagram would get our request on the resend.
+    other.set_read_timeout(Some(punch::SELECT_TIMEOUT * 3)).unwrap();
     let t = thread::spawn(move || {
         let (req, _) = recv(&offered_sock);
         // A response-shaped datagram from a new port at the console's IP: not a request, so nothing back.
@@ -365,8 +372,13 @@ fn only_a_request_makes_a_derived_candidate() {
         offered_sock.send_to(&console_response(&req), our_addr).unwrap();
         heard
     });
-    let (found, _) =
-        punch::check_candidates(&ours, &OURS, &CONSOLE, &[cand(CandidateKind::Static, "127.0.0.1", offered_addr.port())]).unwrap();
+    let (found, _) = punch::check_candidates(
+        &ours,
+        &OURS,
+        &CONSOLE,
+        &[cand(CandidateKind::Static, "127.0.0.1", offered_addr.port())],
+    )
+    .unwrap();
     assert!(!t.join().unwrap());
     assert_eq!(found.candidate.kind, CandidateKind::Static);
 }
@@ -386,8 +398,13 @@ fn a_response_must_carry_our_hashed_id() {
         real[0x04..0x18].fill(0x77); // the console's own ID need not match what we were told
         console.send_to(&real, our_addr).unwrap();
     });
-    let (found, _) =
-        punch::check_candidates(&ours, &OURS, &CONSOLE, &[cand(CandidateKind::Local, "127.0.0.1", console_addr.port())]).unwrap();
+    let (found, _) = punch::check_candidates(
+        &ours,
+        &OURS,
+        &CONSOLE,
+        &[cand(CandidateKind::Local, "127.0.0.1", console_addr.port())],
+    )
+    .unwrap();
     t.join().unwrap();
     assert!(!found.ids_mirrored, "the second, real answer was the one taken");
 }
