@@ -82,10 +82,22 @@ before the real cause was found; whether Sony also accepts `+` was not tested.
   manager: create it, see Sony's "created" and "joined" notifications, and leave it. The console is not involved
   yet. It ports `get_websocket_fqdn`, `websocket_thread_func`, `parse_notification_type`, `http_create_session`,
   `chiaki_holepunch_session_create` and `deleteSession`.
-- **9b-2, the hole itself.** The session start sent to the console, the console's offer and our accept, the
-  candidates (local, STUN, and port guessing), and the UDP exchange that punches the hole. It ports
-  `chiaki_holepunch_session_start`, `holepunch_session_create_offer`, `check_candidates` and
-  `chiaki_holepunch_session_punch_hole`.
+- **9b-2a, the console joins.** The `remotePlay` command to the console; the console joining the session
+  (its device ID checked against the one asked for) and its `customData1`; the session messages, read with
+  chiaki-ng's fix for Sony's broken `localPeerAddr`; and the console's first offer, acknowledged. It ports
+  `chiaki_holepunch_session_start`, `http_start_session`, `decode_customdata1`, `session_message_get_payload`,
+  `session_message_parse`, `short_message_serialize`, `http_send_session_message` and
+  `wait_for_session_message`.
+- **9b-2b, the hole itself.** Our candidates (local, STUN, and port guessing), our offer, the UDP exchange that
+  finds a candidate that answers, and both accepts, for the control port and then the data port. It ports
+  `holepunch_session_create_offer`, `check_candidates` and `chiaki_holepunch_session_punch_hole`.
+
+**9b-2a against the household's PS5 (2026-11-25):**
+1. The PS5 was in rest mode, and the `remotePlay` command woke it: it joined the session about 19 s after the
+   start, with a 16-byte `customData1`.
+2. About 6 s later its first offer arrived: request 1, NAT type 2, with two candidates, one `STATIC` and one
+   `LOCAL`.
+3. Our acknowledgment was accepted, and the session was left cleanly.
 
 **Three findings from verifying 9b-1 (2026-11-25):**
 
