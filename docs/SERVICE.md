@@ -31,13 +31,15 @@ Every `/api` request needs `Authorization: Bearer <token>`, and a `Host` of `127
 `localhost:<port>`. The `Host` check stops a web page from reaching the service by DNS rebinding.
 
 The token is 32 random bytes, made at each start. The service writes it to the configuration folder
-(`service-token`), where the games app will read it, and puts it in the test page it serves.
+(`service-token`, readable by this user only), where the games app will read it. It prints the test page's link
+with the token in the fragment (`http://127.0.0.1:<port>/#token=...`): browsers never send a fragment, and the page
+takes it off the address bar once read. The page itself holds no token, because any local process can fetch it.
 
 | route | does |
 |---|---|
 | `GET /` | the test page: a video element, and a gamepad sent as input |
 | `GET /api/consoles` | the linked consoles (the saved registrations), without keys |
-| `POST /api/play` | `{"host": "<console IP>"}` starts a session with the linked console there. One session at a time |
+| `POST /api/play` | `{"host": "<console IPv4>"}` starts a session with the linked console there, once that address answers discovery as that console. One session, and one start, at a time |
 | `POST /api/offer` | the browser's SDP offer, answered with the service's SDP answer |
 | `POST /api/stop` | ends the session |
 | `GET /api/status` | whether a session runs, and its frame, loss and drop counts |
@@ -51,9 +53,20 @@ that fails, and it never panics on one.
 ## Why each choice
 
 - **Loopback only, with a token:** the API can start a session with the household's console, so nothing but this
-  machine may reach it, and on this machine only a client that can read the token file (or the page the service
-  serves) may. A web page in the same browser can't read either: the page is same-origin to the service, and the API
-  sends no CORS headers.
+  machine may reach it, and on this machine only a client that can read the token file (or was given the printed
+  link) may. A web page in the same browser can't: it can't read the service's responses (no CORS headers), and the
+  `Authorization` header needs a preflight the service never grants.
+- **Play only where the console answers as itself:** the session request carries credentials made from the console's
+  keys, so it goes only to an address that answers discovery with the linked console's ID.
+- **The network can't end a session:** anyone on the LAN can send to the media port. A datagram that is too big,
+  unreadable, or refused by str0m is dropped and counted; only the browser's own peer state ends its side. (Joining a
+  session as the peer needs the ICE credentials and DTLS fingerprint from the loopback offer and answer.)
+- **A panic in the session thread still ends the console's stream** and marks the session stopped, so the console is
+  never left holding a session the API thinks is gone.
+
+The 2026-11-25 security review of the first commit found the token in the served page, junk datagrams ending a
+session, play sending credentials to any address, loose file modes on Unix, an audio clock overflow, and concurrent
+starts. Each is fixed above, with a test.
 - **WebRTC media on the LAN address, not loopback:** Firefox refuses 127.0.0.1 candidates (str0m's own example says so).
   The UDP port is chosen at random for each session.
 - **str0m with its `rust-crypto` backend:** pure Rust, like `psr-crypto`, so there is no OpenSSL or C toolchain.

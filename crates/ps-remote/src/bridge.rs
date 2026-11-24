@@ -60,6 +60,7 @@ pub struct Bridge {
     audio_index: Option<(u16, u64)>,
     /// The data channel named [`INPUT_CHANNEL`], once the browser opens it. Other channels are ignored.
     input_channel: Option<ChannelId>,
+    datagrams_refused: u64,
     closed: bool,
 }
 
@@ -104,6 +105,7 @@ impl Bridge {
             started: now,
             audio_index: None,
             input_channel: None,
+            datagrams_refused: 0,
             closed: false,
         };
         Ok((bridge, answer))
@@ -111,6 +113,11 @@ impl Bridge {
 
     pub fn local_addr(&self) -> SocketAddr {
         self.local
+    }
+
+    /// Datagrams dropped: too big, unreadable, or refused by str0m.
+    pub fn datagrams_refused(&self) -> u64 {
+        self.datagrams_refused
     }
 
     pub fn is_closed(&self) -> bool {
@@ -138,13 +145,17 @@ impl Bridge {
     /// Sends one Opus frame of `frame_size` samples, timed by the console's frame index.
     pub fn send_audio(&mut self, index: u16, frame_size: u32, data: &[u8], now: Instant) -> Result<(), BridgeError> {
         let Some((mid, pt)) = self.audio else { return Ok(()) };
+        // The RTP clock is 32 bits and wraps, so the count is kept with wrapping arithmetic: a frame older
+        // than the first one handed on (a copy the audio receiver passes after it) steps the clock back
+        // instead of overflowing.
         let extended = match self.audio_index {
             None => 0,
             Some((last, ext)) => ext.wrapping_add_signed(i64::from(index.wrapping_sub(last) as i16)),
         };
         self.audio_index = Some((index, extended));
         let Some(writer) = self.rtc.writer(mid) else { return Ok(()) };
-        let time = MediaTime::new(extended * u64::from(frame_size), Frequency::FORTY_EIGHT_KHZ);
+        let samples = extended.wrapping_mul(u64::from(frame_size)) & u64::from(u32::MAX);
+        let time = MediaTime::new(samples, Frequency::FORTY_EIGHT_KHZ);
         writer.write(pt, now, time, data.to_vec())?;
         Ok(())
     }
@@ -162,14 +173,17 @@ impl Bridge {
                         now,
                         Receive { proto: Protocol::Udp, source, destination: self.local, contents },
                     );
-                    if self.rtc.accepts(&input) {
-                        self.rtc.handle_input(input)?;
+                    // Anyone on the network can send to this port: a datagram that str0m refuses is
+                    // dropped and counted, and never ends the session.
+                    if self.rtc.accepts(&input) && self.rtc.handle_input(input).is_err() {
+                        self.datagrams_refused += 1;
                     }
                 }
                 Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => break,
-                // Windows reports an ICMP port-unreachable from an earlier send this way.
-                Err(e) if e.kind() == ErrorKind::ConnectionReset => {}
-                Err(e) => return Err(e.into()),
+                // One datagram's error (too big for the buffer: WSAEMSGSIZE on Windows; an ICMP
+                // port-unreachable from an earlier send) is that datagram's, not the socket's. The loop is
+                // bounded by PUMP_MAX, so an error that repeats cannot hold it.
+                Err(_) => self.datagrams_refused += 1,
             }
         }
         self.rtc.handle_input(Input::Timeout(now))?;

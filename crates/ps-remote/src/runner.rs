@@ -104,7 +104,13 @@ pub fn start(host: IpAddr, console: &RegisteredHost) -> Result<Handle, String> {
         .name("ps-remote session".into())
         .spawn(move || {
             let mut s = Loop { ctrl, stream, media_ip, rx, status: thread_status, bridge: None, header: Vec::new() };
-            let ended = s.run().err().unwrap_or_else(|| "stopped".into());
+            // Whatever happens in the loop, even a panic, the console is told the stream ended and the
+            // status says so; otherwise the console could hold a session the API thinks is gone.
+            let ended = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.run())) {
+                Ok(Ok(())) => "stopped".into(),
+                Ok(Err(e)) => e,
+                Err(_) => "the session failed inside ps-remote".into(),
+            };
             s.finish(ended);
         })
         .map_err(|e| e.to_string())?;

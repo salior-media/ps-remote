@@ -1638,6 +1638,7 @@ dependencies = [
  "axum",
  "getrandom 0.4.3",
  "psr-av",
+ "psr-crypto",
  "psr-input",
  "psr-lan",
  "serde",

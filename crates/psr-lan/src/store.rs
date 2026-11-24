@@ -98,11 +98,43 @@ pub fn from_text(text: &str) -> Result<RegisteredHost, LanError> {
     })
 }
 
-/// Saves the console as `<mac>.txt` in `dir`, creating the folder. Returns the file's path.
+/// Creates `dir` (and its parents) for files only this user may read: on Unix the folder is set to 0700.
+/// On Windows the configuration folder is already the user's own (`%APPDATA%`'s access list).
+pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Writes `contents` to a new file at `path` that only this user may read (0600 on Unix). An existing file
+/// is removed first, so a file made earlier with looser permissions does not keep them.
+pub fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(contents)
+}
+
+/// Saves the console as `<mac>.txt` in `dir`, creating the folder. The file holds the console's keys, so
+/// only this user may read it (see [`write_private`]). Returns the file's path.
 pub fn save(dir: &Path, h: &RegisteredHost) -> Result<PathBuf, LanError> {
-    std::fs::create_dir_all(dir).map_err(LanError::Io)?;
+    create_private_dir(dir).map_err(LanError::Io)?;
     let path = dir.join(format!("{}.txt", hex(&h.server_mac)));
-    std::fs::write(&path, to_text(h)).map_err(LanError::Io)?;
+    write_private(&path, to_text(h).as_bytes()).map_err(LanError::Io)?;
     Ok(path)
 }
 

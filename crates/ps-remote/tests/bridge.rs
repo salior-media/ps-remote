@@ -146,3 +146,30 @@ fn a_picture_loss_from_the_browser_asks_for_a_keyframe() {
     w.request_keyframe(None, KeyframeRequestKind::Pli).unwrap();
     run(&mut bridge, &mut browser, &mut events, |_, _, ev| ev.contains(&BridgeEvent::KeyframeRequested));
 }
+
+#[test]
+fn junk_from_anyone_on_the_network_does_not_end_the_session() {
+    let (mut bridge, mut browser, mut events) = connected();
+    let stranger = UdpSocket::bind("127.0.0.1:0").unwrap();
+    // Larger than the bridge's receive buffer (Windows reports WSAEMSGSIZE), then plain junk.
+    stranger.send_to(&[0x42; 3000], bridge.local_addr()).unwrap();
+    stranger.send_to(&[0x17; 50], bridge.local_addr()).unwrap();
+    stranger.send_to(&[0x80; 40], bridge.local_addr()).unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    let more = bridge.pump(Instant::now()).expect("junk datagrams are skipped, not fatal");
+    assert!(!more.contains(&BridgeEvent::Closed), "{more:?}");
+    events.extend(more);
+    bridge.send_video(&[0, 0, 0, 1, 0x67, 1], &[0, 0, 0, 1, 0x65, 9, 9, 9], Instant::now()).unwrap();
+    run(&mut bridge, &mut browser, &mut events, |_, br, _| br.got(MediaKind::Video).is_some());
+    assert!(!bridge.is_closed());
+}
+
+#[test]
+fn audio_frames_out_of_order_never_overflow_the_clock() {
+    let (mut bridge, _browser, _events) = connected();
+    let now = Instant::now();
+    // The first frame handed on is 100; copies of 98 and 99 follow it, as the audio receiver hands them on.
+    for index in [100u16, 98, 99, 101, 65535, 0, 3] {
+        bridge.send_audio(index, 480, &[0xfc, 1], now).unwrap();
+    }
+}

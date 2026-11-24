@@ -8,7 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 struct Server {
     port: u16,
     token: String,
-    _dir: TempDir,
+    dir: TempDir,
 }
 
 /// A configuration folder of its own, removed afterwards.
@@ -28,7 +28,7 @@ async fn server() -> Server {
     let token = api::new_token().unwrap();
     let service = api::Service::new(token.clone(), port, dir.clone());
     tokio::spawn(async move { axum::serve(listener, api::router(service)).await.unwrap() });
-    Server { port, token, _dir: TempDir(dir) }
+    Server { port, token, dir: TempDir(dir) }
 }
 
 /// Sends one request and returns the status code and the body.
@@ -50,12 +50,15 @@ async fn request(port: u16, method: &str, path: &str, host: &str, token: Option<
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_page_carries_the_token_and_only_for_the_right_host() {
+async fn the_page_is_served_without_the_token_and_only_for_the_right_host() {
     let s = server().await;
     let host = format!("127.0.0.1:{}", s.port);
     let (code, body) = request(s.port, "GET", "/", &host, None, "").await;
     assert_eq!(code, 200);
-    assert!(body.contains(&s.token));
+    // Any local process can fetch the page, so the token is not in it: the page reads it from the URL's
+    // fragment, which the service prints and browsers never send.
+    assert!(!body.contains(&s.token));
+    assert!(body.contains("location.hash"));
     let (code, _) = request(s.port, "GET", "/", &format!("localhost:{}", s.port), None, "").await;
     assert_eq!(code, 200, "localhost is the same service");
     for wrong in
@@ -116,4 +119,49 @@ async fn a_huge_body_is_refused() {
     let big = "v=0\r\n".repeat(20_000);
     let (code, _) = request(s.port, "POST", "/api/offer", &host, Some(&s.token), &big).await;
     assert_eq!(code, 413);
+}
+
+/// Saves a made-up linked console (no real keys) in the server's folder.
+fn link_fake_console(s: &Server) {
+    let host = psr_lan::regist::RegisteredHost {
+        target: psr_crypto::Target::Ps5V1,
+        ap_ssid: None,
+        ap_bssid: None,
+        ap_key: None,
+        ap_name: None,
+        server_mac: [0x02, 0, 0, 0, 0, 0x01],
+        server_nickname: Some("fake".into()),
+        rp_regist_key: [0x31; 16],
+        rp_key_type: 2,
+        rp_key: [0x5a; 16],
+    };
+    psr_lan::store::save(&s.dir.0, &host).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn play_only_starts_where_the_console_answers_as_itself() {
+    let s = server().await;
+    link_fake_console(&s);
+    let host = format!("127.0.0.1:{}", s.port);
+    let t = Some(s.token.as_str());
+    // Nothing answers discovery at 127.0.0.1, so no session request (with its credentials) is sent there.
+    let (code, body) = request(s.port, "POST", "/api/play", &host, t, r#"{"host":"127.0.0.1"}"#).await;
+    assert_eq!(code, 400, "{body}");
+    assert!(body.contains("did not answer as"), "{body}");
+    let (code, _) = request(s.port, "POST", "/api/play", &host, t, r#"{"host":"::1"}"#).await;
+    assert_eq!(code, 400, "IPv6 is not searched, so it is refused");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_one_session_start_at_a_time() {
+    let s = server().await;
+    link_fake_console(&s);
+    let host = format!("127.0.0.1:{}", s.port);
+    let t = Some(s.token.as_str());
+    let body = r#"{"host":"127.0.0.1"}"#;
+    let (a, b) = tokio::join!(request(s.port, "POST", "/api/play", &host, t, body), async {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        request(s.port, "POST", "/api/play", &host, t, body).await
+    });
+    assert_eq!((a.0, b.0), (400, 409), "the second start is refused while the first runs: {a:?} {b:?}");
 }

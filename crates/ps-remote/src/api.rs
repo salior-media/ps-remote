@@ -4,6 +4,7 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -36,6 +37,10 @@ pub struct Service {
     hosts: [String; 2],
     consoles_dir: PathBuf,
     session: Mutex<Option<Handle>>,
+    /// A session start is under way: a second one is refused until it ends.
+    starting: AtomicBool,
+    /// One discovery search at a time, so many requests cannot fill the blocking pool with them.
+    discovery: tokio::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for Service {
@@ -57,6 +62,8 @@ impl Service {
             hosts: [format!("127.0.0.1:{port}"), format!("localhost:{port}")],
             consoles_dir,
             session: Mutex::new(None),
+            starting: AtomicBool::new(false),
+            discovery: tokio::sync::Mutex::new(()),
         })
     }
 }
@@ -112,12 +119,15 @@ async fn require_token(State(s): State<Arc<Service>>, req: Request, next: Next) 
     next.run(req).await
 }
 
-/// The test page, with the token in it: only a page this service served can read it.
-async fn page(State(s): State<Arc<Service>>) -> Response {
-    let mut r = Html(PAGE.replace("{{TOKEN}}", &s.token)).into_response();
+/// The test page. It holds no token: any local process can fetch it. The page reads the token from its
+/// URL's fragment, which the service prints at start and browsers never send.
+async fn page() -> Response {
+    let mut r = Html(PAGE).into_response();
     let h = r.headers_mut();
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     h.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
     h.insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static("default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; media-src 'self' blob:; frame-ancestors 'none'"),
@@ -157,11 +167,7 @@ async fn consoles(State(s): State<Arc<Service>>) -> Response {
     };
     // Discovery only listens for answers to a search broadcast; it wakes nothing. If it fails, the
     // consoles are listed without addresses.
-    let found = tokio::task::spawn_blocking(|| discovery::search(Ipv4Addr::BROADCAST, DISCOVERY_WAIT))
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or_default();
+    let found = search(&s, Ipv4Addr::BROADCAST).await;
     let info: Vec<ConsoleInfo> = list
         .iter()
         .map(|c| {
@@ -177,6 +183,25 @@ async fn consoles(State(s): State<Arc<Service>>) -> Response {
         })
         .collect();
     axum::Json(info).into_response()
+}
+
+/// A discovery search sent to `to` (the broadcast address, or one console), one at a time.
+async fn search(s: &Service, to: Ipv4Addr) -> Vec<discovery::Host> {
+    let _one = s.discovery.lock().await;
+    tokio::task::spawn_blocking(move || discovery::search(to, DISCOVERY_WAIT))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default()
+}
+
+/// Clears [`Service::starting`] however `play` returns.
+struct Starting<'a>(&'a AtomicBool);
+
+impl Drop for Starting<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 #[derive(Deserialize)]
@@ -203,8 +228,25 @@ async fn play(State(s): State<Arc<Service>>, axum::Json(req): axum::Json<PlayReq
             "no such linked console (name one by \"console\" when several are linked)",
         );
     };
+    let IpAddr::V4(ip) = req.host else {
+        return refuse(StatusCode::BAD_REQUEST, "consoles are found over IPv4; give the console's IPv4 address");
+    };
+    if s.starting.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return refuse(StatusCode::CONFLICT, "a session is already starting");
+    }
+    let _starting = Starting(&s.starting);
     if s.session().as_ref().is_some_and(Handle::is_running) {
         return refuse(StatusCode::CONFLICT, "a session is already running");
+    }
+    // The session request carries credentials made from the console's keys, so it only goes to an address
+    // where that console answers discovery as itself.
+    let mac = mac_hex(&console.server_mac);
+    let answered = search(&s, ip).await;
+    if !answered
+        .iter()
+        .any(|h| h.addr == req.host && h.host_id.as_deref().is_some_and(|id| id.eq_ignore_ascii_case(&mac)))
+    {
+        return refuse(StatusCode::BAD_REQUEST, "that address did not answer as the linked console");
     }
     // The handshakes block for a second or two: off the async runtime.
     let started = tokio::task::spawn_blocking(move || runner::start(req.host, &console)).await;

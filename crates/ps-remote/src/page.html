@@ -28,7 +28,11 @@
 <div id="status">Not playing.</div>
 <script>
 "use strict";
-const TOKEN = "{{TOKEN}}";
+// The token comes in the URL's fragment (#token=...), which the service prints at start. Browsers never send
+// a fragment, and it is taken off the address bar here so it isn't left on screen or in history.
+const TOKEN = new URLSearchParams(location.hash.slice(1)).get("token") || "";
+history.replaceState(null, "", location.pathname);
+const NO_TOKEN = "Open this page from the link ps-remote prints when it starts.";
 const auth = { Authorization: "Bearer " + TOKEN };
 const $ = (id) => document.getElementById(id);
 let pc = null, channel = null, lastSent = "";
@@ -116,9 +120,13 @@ async function showStatus() {
 $("play").onclick = () => play().catch((e) => { $("status").textContent = String(e); });
 $("stop").onclick = async () => { if (pc) pc.close(); pc = null; channel = null; await api("/stop", { method: "POST" }); };
 $("sound").onclick = () => { $("video").muted = false; $("video").play(); };
-listConsoles().catch((e) => { $("status").textContent = String(e); });
-setInterval(showStatus, 1000);
-requestAnimationFrame(sendInput);
+if (TOKEN) {
+  listConsoles().catch((e) => { $("status").textContent = String(e); });
+  setInterval(showStatus, 1000);
+  requestAnimationFrame(sendInput);
+} else {
+  $("status").textContent = NO_TOKEN;
+}
 </script>
 </body>
 </html>

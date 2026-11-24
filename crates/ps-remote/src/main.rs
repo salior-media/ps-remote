@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! `ps-remote serve [--port N]`: the service. It listens on 127.0.0.1 only, writes its token to the
-//! configuration folder (`service-token`, beside `consoles`), and prints the address of its test page.
+//! configuration folder (`service-token`, beside `consoles`, readable by this user only), and prints the
+//! link to its test page, with the token in the link's fragment.
 
 use std::net::{Ipv4Addr, SocketAddr};
 
@@ -25,14 +26,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port = port_from_args()?;
     let consoles_dir = store::default_dir().ok_or("no configuration folder (APPDATA / HOME) on this system")?;
     let dir = consoles_dir.parent().ok_or("the configuration folder has no parent")?.to_path_buf();
-    std::fs::create_dir_all(&dir)?;
+    store::create_private_dir(&dir)?;
     let token = api::new_token()?;
     let token_file = dir.join(TOKEN_FILE);
-    std::fs::write(&token_file, &token)?;
+    store::write_private(&token_file, token.as_bytes())?;
 
     let listener = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port))).await?;
     let port = listener.local_addr()?.port();
-    println!("ps-remote is listening on http://127.0.0.1:{port}/ (the API token is in {})", token_file.display());
+    // The link carries the token in its fragment, which a browser never sends; the test page reads it there.
+    println!("ps-remote is listening. Open http://127.0.0.1:{port}/#token={token}");
+    println!("(The token is also in {}, for other clients.)", token_file.display());
     axum::serve(listener, api::router(api::Service::new(token, port, consoles_dir))).await?;
     Ok(())
 }
