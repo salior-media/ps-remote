@@ -194,7 +194,7 @@ fn save_load_and_forget() {
 
 #[test]
 fn spaces_are_sent_as_percent_20_and_plus_signs_survive() {
-    // Sony's token service reads '+' literally: the scopes must be joined by %20.
+    // The scopes go joined by %20, closest to chiaki-ng's plain spaces.
     let body = auth::refresh_request("a+b c");
     assert!(!body.contains('+'), "{body}");
     assert!(body.contains("scope=psn%3Aclientapp%20referenceDataService"), "{body}");

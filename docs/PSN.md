@@ -58,7 +58,8 @@ four scopes was then refused: `invalid_scope`, Sony's code 4153.
 - **The fix:** the address is printed with `%20`.
 - **The check:** after signing in again, the console list works, and so does a second refresh from the saved token.
 
-Sony's token service also reads `+` in a form body literally, so request bodies send spaces as `%20`.
+Request bodies send spaces as `%20`, closest to chiaki-ng's plain spaces. This was changed during the diagnosis,
+before the real cause was found; whether Sony also accepts `+` was not tested.
 
 ## What 9a does not do yet
 

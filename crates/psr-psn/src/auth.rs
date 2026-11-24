@@ -53,9 +53,9 @@ pub fn code_from_redirect(address: &str) -> Result<String, PsnError> {
         .ok_or(PsnError::NoCode)
 }
 
-/// A form body with each value percent-encoded. Spaces are sent as `%20`, not the form encoding's `+`: Sony's
-/// token service reads `+` literally, and a refresh with the scopes joined by `+` is refused as
-/// `invalid_scope`. (Every `+` in a value is `%2B` by then, so each `+` left is a space.)
+/// A form body with each value percent-encoded, and spaces sent as `%20` rather than the form encoding's `+`:
+/// chiaki-ng sends the scopes with plain spaces, and `%20` is the closest encoded match. Whether Sony also
+/// accepts `+` has not been tested. (Every `+` in a value is `%2B` by then, so each `+` left is a space.)
 fn form(pairs: &[(&str, &str)]) -> String {
     url::form_urlencoded::Serializer::new(String::new()).extend_pairs(pairs).finish().replace('+', "%20")
 }
