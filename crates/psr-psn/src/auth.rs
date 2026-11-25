@@ -147,3 +147,20 @@ pub fn exchange_code(secret: &str, code: &str) -> Result<Tokens, PsnError> {
 pub fn refresh(secret: &str, refresh_token: &str) -> Result<Tokens, PsnError> {
     post_token("token refresh", secret, refresh_request(refresh_token))
 }
+
+/// The account ID that linking with a console needs, from Sony's information on `access` (chiaki-ng
+/// `scripts/psn-account-id.py`, and `gui/include/psnaccountid.h`).
+pub fn account_id(secret: &str, access: &str) -> Result<[u8; 8], PsnError> {
+    // Sony takes the access token in the path, so a failure is reported without the request's address.
+    let path: String = url::form_urlencoded::byte_serialize(access.as_bytes()).collect();
+    let sent = crate::agent().get(&format!("{TOKEN_URL}/{path}")).header("Authorization", basic_auth(secret)).call();
+    let sent = sent.map_err(|_| PsnError::Network("the account ID request did not reach Sony".into()));
+    account_id_from_info(&crate::reply("account ID", Ok(sent?))?)
+}
+
+/// Sony's token information names the account by `user_id`, a decimal string; the console wants it as eight
+/// little-endian bytes.
+pub fn account_id_from_info(info: &serde_json::Value) -> Result<[u8; 8], PsnError> {
+    let id: u64 = info["user_id"].as_str().and_then(|s| s.parse().ok()).ok_or(PsnError::MissingField("user_id"))?;
+    Ok(id.to_le_bytes())
+}

@@ -16,7 +16,8 @@ use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use psr_lan::discovery;
-use psr_lan::regist::RegisteredHost;
+use psr_lan::discovery::{Console, HostState};
+use psr_lan::regist::{self, Identity, RegisteredHost};
 use psr_lan::store;
 use serde::{Deserialize, Serialize};
 use str0m::change::SdpOffer;
@@ -98,6 +99,8 @@ pub fn router(service: Arc<Service>) -> Router {
         .route("/psn-consoles", get(psn_consoles))
         .route("/offer", post(offer))
         .route("/stop", post(stop))
+        .route("/link", post(link))
+        .route("/wake", post(wake))
         .route("/status", get(status))
         .route_layer(middleware::from_fn_with_state(Arc::clone(&service), require_token));
     Router::new()
@@ -241,17 +244,143 @@ struct PlayRequest {
     console: Option<String>,
 }
 
+/// The linked console a request names by MAC, or the only one when it names none.
+fn pick(list: Vec<RegisteredHost>, mac: Option<&str>) -> Option<RegisteredHost> {
+    match (mac, list.len()) {
+        (Some(mac), _) => list.into_iter().find(|c| mac_hex(&c.server_mac) == mac.to_ascii_lowercase()),
+        (None, 1) => list.into_iter().next(),
+        (None, _) => None,
+    }
+}
+
+/// Where `console` answers discovery as itself at `host`, if it does.
+async fn answering_as(s: &Service, host: Ipv4Addr, console: &RegisteredHost) -> Option<discovery::Host> {
+    let mac = mac_hex(&console.server_mac);
+    search(s, host)
+        .await
+        .into_iter()
+        .find(|h| h.addr == IpAddr::V4(host) && h.host_id.as_deref().is_some_and(|id| id.eq_ignore_ascii_case(&mac)))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LinkRequest {
+    host: IpAddr,
+    /// The 8 digits on the console's *Link Device* screen; spaces are ignored.
+    pin: String,
+    /// The PSN account ID, base64. Without it, the service asks Sony using the saved sign-in.
+    account_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct Linked {
+    nickname: Option<String>,
+    mac: String,
+}
+
+/// The PIN as a number, if it is 8 digits. Never echoed: it is a secret for as long as the screen shows it.
+fn pin(text: &str) -> Option<u32> {
+    let digits: String = text.chars().filter(|c| *c != ' ').collect();
+    (digits.len() == 8 && digits.bytes().all(|b| b.is_ascii_digit())).then(|| digits.parse().ok()).flatten()
+}
+
+/// Links with the console at `host` (`docs/SERVICE.md`, step 8c), as the `link` example does.
+async fn link(State(s): State<Arc<Service>>, axum::Json(req): axum::Json<LinkRequest>) -> Response {
+    let Some(pin) = pin(&req.pin) else {
+        return refuse(StatusCode::BAD_REQUEST, "the PIN is the 8 digits on the console's Link Device screen");
+    };
+    let IpAddr::V4(ip) = req.host else {
+        return refuse(StatusCode::BAD_REQUEST, "consoles are found over IPv4; give the console's IPv4 address");
+    };
+    let given = match req.account_id.as_deref().map(Identity::account_id_from_base64) {
+        Some(Ok(id)) => Some(id),
+        Some(Err(e)) => return refuse_owned(StatusCode::BAD_REQUEST, e.to_string()),
+        None if s.psn.is_none() => {
+            return refuse(
+                StatusCode::BAD_REQUEST,
+                "give account_id (from the psn_account_id example), or start the service with PSN_RP_CLIENT_SECRET and sign in",
+            );
+        }
+        None => None,
+    };
+    let Some(starting) = Starting::take(&s) else {
+        return refuse(StatusCode::CONFLICT, "a session is starting");
+    };
+    let Some(found) = search(&s, ip).await.into_iter().find(|h| h.addr == req.host) else {
+        return refuse(StatusCode::BAD_REQUEST, "that address did not answer discovery as a console; is it on?");
+    };
+    let psn = s.psn.as_ref().map(|p| (p.app_secret.clone(), p.config_dir.clone()));
+    let dir = s.consoles_dir.clone();
+    // Registration and the account ID lookup block for seconds: off the async runtime, holding the start slot.
+    let done = tokio::task::spawn_blocking(move || {
+        let _starting = starting;
+        let identity = match (given, psn) {
+            (Some(id), _) => id,
+            (None, Some((secret, config))) => Identity::AccountId(
+                psr_psn::play::account_id(&secret, &config).map_err(|e| format!("the account ID from PSN: {e}"))?,
+            ),
+            (None, None) => unreachable!("refused above when there is no account ID and no PSN"),
+        };
+        let registered = regist::register(found.addr, found.target(), &identity, pin)
+            .map_err(|e| format!("linking did not work: {e}"))?;
+        store::save(&dir, &registered).map_err(|e| format!("linked, but the keys could not be saved: {e}"))?;
+        Ok::<_, String>(Linked { nickname: registered.server_nickname.clone(), mac: mac_hex(&registered.server_mac) })
+    })
+    .await;
+    match done {
+        Ok(Ok(linked)) => axum::Json(linked).into_response(),
+        Ok(Err(why)) => refuse_owned(StatusCode::BAD_GATEWAY, why),
+        Err(_) => refuse(StatusCode::INTERNAL_SERVER_ERROR, "linking failed"),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WakeRequest {
+    host: IpAddr,
+    console: Option<String>,
+}
+
+/// Wakes a linked console from rest mode. The datagram carries its wake-up credential, so it goes only to an
+/// address that answered discovery as that console.
+async fn wake(State(s): State<Arc<Service>>, axum::Json(req): axum::Json<WakeRequest>) -> Response {
+    let list = match linked(&s) {
+        Ok(l) => l,
+        Err(r) => return *r,
+    };
+    let Some(console) = pick(list, req.console.as_deref()) else {
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            "no such linked console (name one by \"console\" when several are linked)",
+        );
+    };
+    let IpAddr::V4(ip) = req.host else {
+        return refuse(StatusCode::BAD_REQUEST, "consoles are found over IPv4; give the console's IPv4 address");
+    };
+    let Some(found) = answering_as(&s, ip, &console).await else {
+        return refuse(StatusCode::BAD_REQUEST, "that address did not answer as the linked console");
+    };
+    if found.state != HostState::Standby {
+        return axum::Json(serde_json::json!({ "sent": false })).into_response();
+    }
+    let Some(credential) = console.wakeup_credential() else {
+        return refuse(StatusCode::INTERNAL_SERVER_ERROR, "the saved registration key is not a wake-up credential");
+    };
+    let kind = if found.is_ps5() { Console::Ps5 } else { Console::Ps4 };
+    let sent = tokio::task::spawn_blocking(move || discovery::wake(found.addr, kind, credential)).await;
+    match sent {
+        Ok(Ok(())) => axum::Json(serde_json::json!({ "sent": true })).into_response(),
+        Ok(Err(e)) => refuse_owned(StatusCode::BAD_GATEWAY, format!("the wake-up did not go out: {e}")),
+        Err(_) => refuse(StatusCode::INTERNAL_SERVER_ERROR, "waking failed"),
+    }
+}
+
 async fn play(State(s): State<Arc<Service>>, axum::Json(req): axum::Json<PlayRequest>) -> Response {
     let list = match linked(&s) {
         Ok(l) => l,
         Err(r) => return *r,
     };
-    let console = match (&req.console, list.len()) {
-        (Some(mac), _) => list.into_iter().find(|c| mac_hex(&c.server_mac) == mac.to_ascii_lowercase()),
-        (None, 1) => list.into_iter().next(),
-        (None, _) => None,
-    };
-    let Some(console) = console else {
+    let Some(console) = pick(list, req.console.as_deref()) else {
         return refuse(
             StatusCode::BAD_REQUEST,
             "no such linked console (name one by \"console\" when several are linked)",

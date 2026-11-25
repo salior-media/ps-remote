@@ -244,3 +244,14 @@ fn a_client_device_id_is_chiaki_ngs_prefix_and_16_random_bytes() {
     assert!(a.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)));
     assert_ne!(a, b, "a new one each time");
 }
+
+#[test]
+fn the_account_id_is_sonys_user_id_as_eight_little_endian_bytes() {
+    // chiaki-ng `scripts/psn-account-id.py`: base64 of the user ID packed as `<Q`.
+    let info = serde_json::json!({ "user_id": "1234567890123456789" });
+    let id = psr_psn::auth::account_id_from_info(&info).unwrap();
+    assert_eq!(id, 1234567890123456789u64.to_le_bytes());
+    for bad in [serde_json::json!({}), serde_json::json!({"user_id": 5}), serde_json::json!({"user_id": "12x"})] {
+        assert!(psr_psn::auth::account_id_from_info(&bad).is_err(), "{bad}");
+    }
+}
