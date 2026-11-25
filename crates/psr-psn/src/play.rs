@@ -195,6 +195,11 @@ pub fn chosen(devices: &[devices::Device]) -> Option<usize> {
     devices.iter().position(|d| d.remote_play)
 }
 
+/// The account ID, from the saved sign-in: what linking with a console at home needs.
+pub fn account_id(app_secret: &str, config_dir: &Path) -> Result<[u8; 8], PsnError> {
+    auth::account_id(app_secret, &sign_in(app_secret, config_dir)?.access)
+}
+
 /// The account's consoles, from the saved sign-in.
 pub fn account_consoles(app_secret: &str, config_dir: &Path) -> Result<Vec<devices::Device>, PsnError> {
     devices::list(&sign_in(app_secret, config_dir)?.access)

@@ -82,6 +82,8 @@ async fn every_api_route_needs_the_token() {
         ("POST", "/api/play"),
         ("POST", "/api/offer"),
         ("POST", "/api/stop"),
+        ("POST", "/api/link"),
+        ("POST", "/api/wake"),
     ];
     for (method, path) in routes {
         for token in [None, Some(wrong.as_str()), Some(short), Some("")] {
@@ -188,4 +190,73 @@ async fn the_psn_console_list_needs_the_token_and_says_when_it_is_off() {
     assert_eq!(code, 401);
     let (code, body) = request(s.port, "GET", "/api/psn-consoles", &host, Some(&s.token), "").await;
     assert_eq!(code, 503, "{body}");
+}
+
+const ACCOUNT: &str = "AQIDBAUGBwg="; // 8 bytes, base64
+
+/// A POST with the token and the right Host.
+async fn post(s: &Server, path: &str, body: &str) -> (u16, String) {
+    request(s.port, "POST", path, &format!("127.0.0.1:{}", s.port), Some(&s.token), body).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn link_checks_its_request_before_it_reaches_a_console() {
+    let s = server().await;
+    let s = &s;
+    let link = |body: String| async move { post(s, "/api/link", &body).await };
+    for pin in ["1234567", "123456789", "1234abcd", "", "-1234567", "+1234567"] {
+        let (code, body) = link(format!(r#"{{"host":"127.0.0.1","pin":"{pin}","account_id":"{ACCOUNT}"}}"#)).await;
+        assert_eq!(code, 400, "PIN {pin:?}: {body}");
+        assert!(body.contains("8 digits"), "{body}");
+        assert!(pin.is_empty() || !body.contains(pin), "the PIN is not echoed: {body}");
+    }
+    let (code, _) = link(format!(r#"{{"host":"::1","pin":"12345678","account_id":"{ACCOUNT}"}}"#)).await;
+    assert_eq!(code, 400, "IPv6 is not searched");
+    let (code, body) = link(format!(r#"{{"host":"8.8.8.8","pin":"12345678","account_id":"{ACCOUNT}"}}"#)).await;
+    assert_eq!(code, 400, "an internet address is not searched: {body}");
+    assert!(body.contains("home network"), "{body}");
+    // A PIN sent as a number is refused without quoting it back.
+    let (code, body) = link(r#"{"host":"127.0.0.1","pin":87654321}"#.into()).await;
+    assert_eq!(code, 422, "{body}");
+    assert!(!body.contains("87654321"), "{body}");
+    let (code, body) = link(r#"{"host":"127.0.0.1","pin":"12345678","account_id":"not base64!"}"#.into()).await;
+    assert_eq!(code, 400, "{body}");
+    let (code, body) = link(r#"{"host":"127.0.0.1","pin":"12345678"}"#.into()).await;
+    assert_eq!(code, 400, "no account ID, and PSN is off: {body}");
+    assert!(body.contains("account_id"), "{body}");
+    let (code, _) = link(format!(r#"{{"host":"127.0.0.1","pin":"12345678","account_id":"{ACCOUNT}","x":1}}"#)).await;
+    assert_eq!(code, 422, "unknown fields are refused");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn link_only_registers_where_a_console_answers() {
+    let s = server().await;
+    let host = format!("127.0.0.1:{}", s.port);
+    let body = format!(r#"{{"host":"127.0.0.1","pin":"1234 5678","account_id":"{ACCOUNT}"}}"#);
+    let (code, answer) = request(s.port, "POST", "/api/link", &host, Some(&s.token), &body).await;
+    assert_eq!(code, 400, "{answer}");
+    assert!(answer.contains("did not answer"), "{answer}");
+    assert!(!answer.contains("12345678") && !answer.contains("1234 5678"), "{answer}");
+    let (_, consoles) = request(s.port, "GET", "/api/consoles", &host, Some(&s.token), "").await;
+    assert_eq!(consoles, "[]", "nothing was saved");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wake_only_goes_where_the_console_answers_as_itself() {
+    let s = server().await;
+    let host = format!("127.0.0.1:{}", s.port);
+    let t = Some(s.token.as_str());
+    let (code, _) = request(s.port, "POST", "/api/wake", &host, t, r#"{"host":"127.0.0.1"}"#).await;
+    assert_eq!(code, 400, "no linked console");
+    link_fake_console(&s);
+    let (code, body) = request(s.port, "POST", "/api/wake", &host, t, r#"{"host":"127.0.0.1"}"#).await;
+    assert_eq!(code, 400, "{body}");
+    assert!(body.contains("did not answer as"), "{body}");
+    let (code, _) = request(s.port, "POST", "/api/wake", &host, t, r#"{"host":"::1"}"#).await;
+    assert_eq!(code, 400, "IPv6 is not searched");
+    let (code, body) = request(s.port, "POST", "/api/wake", &host, t, r#"{"host":"8.8.8.8"}"#).await;
+    assert_eq!(code, 400, "{body}");
+    assert!(body.contains("home network"), "the credential is never sent to the internet: {body}");
+    let (code, _) = request(s.port, "POST", "/api/wake", &host, t, r#"{"host":"127.0.0.1","pin":"1"}"#).await;
+    assert_eq!(code, 422, "unknown fields are refused");
 }

@@ -44,6 +44,8 @@ takes it off the address bar once read. The page itself holds no token, because 
 | `GET /api/psn-consoles` | the PSN account's consoles from Sony (name, Remote Play on or off, and which one `/api/play-psn` plays; the others are home network only). No device IDs. Each call refreshes the saved sign-in, so it takes the start slot (409 while a start runs); 503 without `PSN_RP_CLIENT_SECRET` |
 | `POST /api/play` | `{"host": "<console IPv4>"}` starts a session with the linked console there, once that address answers discovery as that console. One session, and one start, at a time |
 | `POST /api/play-psn` | No body. Plays the PSN account's first console with Remote Play on, from away, through Sony's servers and two punched holes (`docs/PSN.md`, 9c-3b); around 30 to 40 s. Needs `PSN_RP_CLIENT_SECRET` in the service's environment when it starts (kept in memory only) and a saved sign-in (`ps-remote signin`); otherwise 503. Same one-at-a-time rules as `/api/play`; the browser then connects with `/api/offer` as for a home session |
+| `POST /api/link` | `{"host": "<console IPv4>", "pin": "<8 digits>"}`, with `"account_id"` (base64, as the `psn_account_id` example prints it) unless the service has PSN on and a saved sign-in, in which case it asks Sony. Links with the console that answers discovery there, with the PIN from its *Link Device* screen, and saves its keys as the `link` example does. Answers the console's nickname and MAC, never its keys. Takes the start slot (409 while a start runs) |
+| `POST /api/wake` | `{"host": "<console IPv4>"}` (and `"console"` when several are linked) wakes the linked console there from rest mode, once that address answers discovery as that console (a private address only). Answers `{"sent": true}` when it sent one, and `{"sent": false, "state": …}` when the console was not in rest mode |
 | `POST /api/offer` | the browser's SDP offer, answered with the service's SDP answer |
 | `POST /api/stop` | ends the session |
 | `GET /api/status` | whether a session runs, its frame, loss and drop counts, and `bitrate_kbps`: the video and audio received over the last second. The console-to-service delay is not reported: chiaki-ng's way to measure it (Senkusha) is compiled there but never switched on, as no build defines `ENABLE_SENKUSHA`. The test page shows the browser's share instead, from WebRTC's own counters: the browser-to-service round trip, and per frame the time buffered, decoding, and from received to shown |
@@ -53,6 +55,44 @@ takes it off the address bar once read. The page itself holds no token, because 
 that fails, and it never panics on one.
 
 **A picture lost in the browser** (a WebRTC PLI or FIR) becomes the console's IDR request.
+
+## Linking and waking (step 8c)
+
+> Owner, 2026-11-26, after the PlayStation tab played in their browser (*"iitt   work"*), asked what was left and
+> offered *link and wake from the tab* first: *"okay lets contuine"*.
+
+The play-anywhere scope's PlayStation tab *"lists consoles, links them, wakes them, plays"*. Until now linking was
+the `link` example and waking had no route. Two routes add them, built from the same parts the examples use:
+
+- **`/api/link`** runs `psr_lan::regist::register` against the console that answers discovery at the given address,
+  then `psr_lan::store::save`. The PSN account ID comes from the request, or from Sony using the saved sign-in
+  (`psr_psn::auth::account_id`, chiaki-ng's `scripts/psn-account-id.py`). The PIN is checked to be 8 digits and is
+  never logged or echoed.
+- **`/api/wake`** sends chiaki-ng's `WAKEUP` datagram (`psr_lan::discovery::wake`) only to a private address that
+  answered discovery as that linked console, in rest mode, because the datagram carries the console's wake-up
+  credential. Discovery is unauthenticated UDP, so this check stops a mistake, not a liar: a device on the home
+  network that claims the console's ID gets the datagram, and anything that can watch the network can read it, as
+  with chiaki-ng. Play has the same limit.
+- **Linking saves only the console that answered.** The MAC in the registration reply must be the `host-id` the
+  address gave in discovery, so a device cannot answer as one console and replace another console's keys.
+
+game-play forwards both, and its PlayStation tab gets *Link a console* (address and PIN) and *Wake* controls.
+
+**Done when:** the routes' checks are tested (token, Host, PIN shape, IPv4 only, unknown fields, an address that does
+not answer as a console, no account ID without PSN), and live, the household PS5 wakes from rest mode from the tab.
+Linking live needs the console's *Link Device* screen open; it re-links the same console, which replaces its saved keys.
+
+**Review, 2026-11-26:** a security review found no critical or high issues. Its two mediums are fixed (linking
+saves only the console that answered; the wake docs no longer claim more than an unauthenticated check gives), and
+so are three lows: private addresses only, no echo of a malformed body, and the state said when nothing is sent.
+Left as they are: a save can fail if `/api/consoles` holds the file open at that moment (the reply says the keys
+were not saved), the consoles folder fails closed on a bad file, and nothing on this side limits PIN attempts (the
+console does). No test has a fake console answering registration, so linking's success path is tested live only.
+
+**Live, 2026-11-26, through game-play:** the household PS5 was in rest mode; `/api/wake` answered `{"sent": true}`
+and the console answered discovery as ready about 10 to 12 s later (done twice). Waking it while awake answered
+`{"sent": false, "state": "Ready"}`. A wake to another address, to an internet address, and a link with a malformed
+PIN were refused. Linking itself was not run live: it needs the *Link Device* screen open.
 
 ## Why each choice
 
