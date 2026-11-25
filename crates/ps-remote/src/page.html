@@ -107,8 +107,9 @@ $("video").addEventListener("pointerdown", (e) => {
   const used = new Set([...fingers.values()].map((f) => f.id));
   let id = 0;
   while (used.has(id)) id++;
+  // Captured first: a finger only counts once its lifting is sure to be seen here.
+  try { $("video").setPointerCapture(e.pointerId); } catch { return; }
   fingers.set(e.pointerId, { id, ...at(e) });
-  $("video").setPointerCapture(e.pointerId);
   e.preventDefault();
   flushInput();
 });
@@ -118,9 +119,13 @@ $("video").addEventListener("pointermove", (e) => {
   Object.assign(f, at(e));
   flushInput();
 });
-for (const end of ["pointerup", "pointercancel"]) {
+for (const end of ["pointerup", "pointercancel", "lostpointercapture"]) {
   $("video").addEventListener(end, (e) => { if (fingers.delete(e.pointerId)) flushInput(); });
 }
+// Leaving the page lifts every finger, so none stays held on the console.
+function liftAll() { if (fingers.size) { fingers.clear(); flushInput(); } }
+window.addEventListener("blur", liftAll);
+document.addEventListener("visibilitychange", () => { if (document.hidden) liftAll(); });
 
 function flushInput() {
   if (channel && channel.readyState === "open") {
