@@ -128,6 +128,16 @@ open still forgotten, an address that is not Sony's
 redirect page refused without being echoed, no code, the status before and after a saved sign-in, sign-out), and
 live, the owner signs in from the tab and the PSN console list answers.
 
+**Review, 2026-11-26:** a security review found no critical or high issues. Fixed: sign-in and sign-out wait for a
+running session (MEDIUM: its renewed token, saved on the way out, would undo them); sign-out answers 503 with PSN off
+instead of 204, and removes a leftover temporary file; the status checks only that the file is there, so a sign-in
+that no longer opens can still be replaced or forgotten. Recorded, not fixed: someone else's pasted redirect (above).
+The wait for a running session has no test: the tests cannot start one.
+
+**Live, 2026-11-26:** through game-play, the status, the sign-in page and a refused wrong address answered as
+designed. The owner then signed out and back in from the tab, on Sony's page: *"it worked"*. Afterwards the status
+said signed in and the PSN console list named the household PS5 for play over PSN.
+
 ## Why each choice
 
 - **Loopback only, with a token:** the API can start a session with the household's console, so nothing but this
