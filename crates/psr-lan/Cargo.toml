@@ -17,6 +17,9 @@ psr-proto = { path = "../psr-proto" }
 psr-takion = { path = "../psr-takion" }
 thiserror = "=2.0.21"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Networking_WinSock"] }
+
 [dev-dependencies]
 serde_json = "=1.0.152"
 ureq = { version = "=3.5.0", features = ["json"] }

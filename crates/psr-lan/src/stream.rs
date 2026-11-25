@@ -313,10 +313,9 @@ impl std::fmt::Debug for Stream {
 
 /// Receives one datagram within `timeout`; `None` when none came.
 fn recv(socket: &UdpSocket, timeout: Duration) -> Result<Option<Vec<u8>>, LanError> {
-    socket.set_read_timeout(Some(timeout.max(Duration::from_millis(1)))).map_err(io)?;
     let mut buf = [0u8; RECV_BUF];
-    match socket.recv(&mut buf) {
-        Ok(n) => Ok(Some(buf[..n].to_vec())),
+    match crate::udp::recv_within(socket, &mut buf, timeout) {
+        Ok(n) => Ok(n.map(|n| buf[..n].to_vec())),
         Err(e) if is_timeout(&e) => Ok(None),
         // Windows reports an ICMP port-unreachable from an earlier send this way.
         Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => Ok(None),

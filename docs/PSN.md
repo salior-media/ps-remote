@@ -275,15 +275,30 @@ steps of chiaki-ng's 200 ms resend wake-up, rather than by a thread.
   PSN the hole's address is the only thing in the way; at home TCP's sequence numbers made that harder. The
   session request also carries the registration key in the clear, as at home.
 
-**Found while verifying 9c-2: on Windows, an answer arriving as a receive times out can be lost.** The punch test
-`only_a_request_makes_a_derived_candidate` failed 6 runs in 20. Its stand-in console answered 1.5 s after the
-first request, exactly when one of our 500 ms receive timeouts runs out. Answering 250 ms off that boundary, it
-passed 20 in 20, and the junk datagram the test also sends made no difference (6 in 20 without it). With the
-answer printed as it was received, the failure stopped appearing at all, which is what a race would do. A first
-guess, that the stand-in's socket closing cost the answer, was wrong: keeping it open still failed 6 in 20.
-A second test, `an_address_at_an_ip_not_offered_is_passed_over`, failed the same way in a full run: its console answered 500 ms in, on the boundary again. Microsoft's documentation does not describe such a loss, so it stands only on these runs. Both tests now answer
-off the boundary (the punch suite then passed 12 runs in 12); **every UDP wait in psr-psn (STUN, the punch, RUDP) receives with timeouts the same way**, so a
-real answer could be lost the same way. The resends recover from it so far, but it is not fixed.
+**Found while verifying 9c-2, and fixed: on Windows an answer that arrives as a receive times out can be lost.**
+1. The punch test `only_a_request_makes_a_derived_candidate` failed 9 runs in 20. Its stand-in console answers
+   1.5 s after our first request, as one of our 500 ms waits ends, and on failing runs the answer never came out
+   of the receive. `an_address_at_an_ip_not_offered_is_passed_over`, answering at 500 ms, failed the same way.
+2. Guesses that were wrong, each falsified by a run: the stand-in's socket closing (held open: still 6 in 20),
+   and the junk datagram the first test also sends (left out: still 6 in 20). A plain reproduction, a receiver
+   with 5 ms timeouts and a sender paced to them, lost nothing in 400 datagrams, with or without sends between
+   the waits; so the loss needs something of the punch's pattern that is not understood. Any output written
+   while the test ran, even into memory, made it stop failing.
+3. What discriminated: the same test, unchanged, with only the receive replaced by `WSAPoll` (waiting for the
+   socket to be readable, then receiving without a timeout of its own) went from 9 failures in 20 to none in
+   20; the whole punch suite then passed 20 runs in 20, and with the old receive put back inside the new helper
+   it failed 4 runs in 10. Winsock's documentation says nothing about what a timed-out receive leaves behind.
+4. **The fix:** `psr_lan::udp::recv_within` and `recv_from_within`, which every UDP wait now uses: STUN, the
+   candidate check and the answers after it, RUDP's two loops, and at home discovery, the registration search
+   and the stream. Both tests stay on the boundary as its regression test. Elsewhere than Windows the read
+   timeout is used as before. The whole path ran live again after the change, to the data hole.
+5. **Its security review** (no critical or high findings; reasoned, not run) changed three things. A readiness
+   with nothing behind it now waits again for the rest of the time, instead of reading as the wait over, which
+   would have ended discovery and the registration search early; such a wake pauses 1 ms, so it cannot spin; and
+   a datagram received is kept even if blocking mode cannot be put back. A test checks that a send to a closed
+   port still surfaces as Windows' connection reset through the wait, which the registration search reads as
+   the console not listening. Not tested: the spurious readiness itself, which needs a seam to fake; and the
+   cost to the home stream, now four system calls a packet instead of two, not measured against a real stream.
 
 **Not verified yet:** any of it from another network; the data hole's use (the stream over it is 9c-3).
 

@@ -282,10 +282,10 @@ fn search(host: IpAddr, target: Target) -> Result<SocketAddr, LanError> {
     let mut buf = [0u8; 0x100];
     loop {
         let left = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()).ok_or(LanError::Timeout("search"))?;
-        socket.set_read_timeout(Some(left)).map_err(io)?;
-        match socket.recv_from(&mut buf) {
-            Ok((n, from)) if buf[..n].starts_with(res) => return Ok(SocketAddr::new(from.ip(), REGIST_PORT)),
-            Ok(_) => continue,
+        match crate::udp::recv_from_within(&socket, &mut buf, left) {
+            Ok(None) => return Err(LanError::Timeout("search")),
+            Ok(Some((n, from))) if buf[..n].starts_with(res) => return Ok(SocketAddr::new(from.ip(), REGIST_PORT)),
+            Ok(Some(_)) => continue,
             Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
                 return Err(LanError::Timeout("search"));
             }

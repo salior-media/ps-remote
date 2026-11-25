@@ -101,14 +101,14 @@ pub fn ask(sock: &UdpSocket, server: SocketAddrV4) -> Result<Option<SocketAddrV4
         if left.is_zero() {
             return Ok(None);
         }
-        sock.set_read_timeout(Some(left)).map_err(io)?;
-        match sock.recv_from(&mut buf) {
-            Ok((n, SocketAddr::V4(from))) if from == server => {
+        match psr_lan::udp::recv_from_within(sock, &mut buf, left) {
+            Ok(None) => {}
+            Ok(Some((n, SocketAddr::V4(from)))) if from == server => {
                 if let Some(addr) = parse_binding_response(&buf[..n], &txid) {
                     return Ok(Some(addr));
                 }
             }
-            Ok(_) => {}
+            Ok(Some(_)) => {}
             Err(e) if is_transient(&e) => {}
             Err(e) => return Err(io(e)),
         }
