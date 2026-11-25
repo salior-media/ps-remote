@@ -46,7 +46,7 @@ takes it off the address bar once read. The page itself holds no token, because 
 | `POST /api/play-psn` | No body. Plays the PSN account's first console with Remote Play on, from away, through Sony's servers and two punched holes (`docs/PSN.md`, 9c-3b); around 30 to 40 s. Needs `PSN_RP_CLIENT_SECRET` in the service's environment when it starts (kept in memory only) and a saved sign-in (`ps-remote signin`); otherwise 503. Same one-at-a-time rules as `/api/play`; the browser then connects with `/api/offer` as for a home session |
 | `POST /api/offer` | the browser's SDP offer, answered with the service's SDP answer |
 | `POST /api/stop` | ends the session |
-| `GET /api/status` | whether a session runs, its frame, loss and drop counts, and `bitrate_kbps`: the video and audio received over the last second. Delay is not reported: chiaki-ng measures it with Senkusha, which this port skips |
+| `GET /api/status` | whether a session runs, its frame, loss and drop counts, and `bitrate_kbps`: the video and audio received over the last second. The console-to-service delay is not reported: chiaki-ng's way to measure it (Senkusha) is compiled there but never switched on, as no build defines `ENABLE_SENKUSHA`. The test page shows the browser's share instead, from WebRTC's own counters: the browser-to-service round trip, and per frame the time buffered, decoding, and from received to shown |
 
 **Input** on the data channel `input` is a JSON object per change: `buttons` (psr-input's bits), `l2` and `r2`
 (0 to 255), and `lx`, `ly`, `rx` and `ry` (−32768 to 32767). The service checks each field's range and drops a message
