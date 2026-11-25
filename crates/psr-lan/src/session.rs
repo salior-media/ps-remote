@@ -284,6 +284,11 @@ pub trait CtrlLink: Send {
     /// What arrives within `timeout`, as ctrl frame bytes: nothing if it ran out first. The console
     /// closing the channel is [`LanError::CtrlClosed`].
     fn read(&mut self, timeout: Duration) -> Result<Vec<u8>, LanError>;
+    /// Asks the console to move to the stream connection, where the link has a message for it: RUDP's over
+    /// PSN (chiaki-ng `chiaki_rudp_send_switch_to_stream_connection_message`). Nothing at home.
+    fn switch_to_stream(&mut self) -> Result<bool, LanError> {
+        Ok(false)
+    }
 }
 
 /// The home network's ctrl connection.
@@ -429,6 +434,29 @@ impl Session {
         self.send(MessageType::MicToggle.code(), &[0, 1, 1, 89])?;
         self.send(MessageType::MicToggle.code(), &[0, 1, 1, 89])?;
         self.send(MessageType::DisplayDevices.code(), &[0; 4])
+    }
+
+    /// chiaki-ng's step before the stream connection over PSN: the link's switch message, then the console's
+    /// `SwitchToStreamConnection` within `timeout`. The other messages that come meanwhile are returned. At
+    /// home, where the link has no such message, nothing is sent and nothing waited for.
+    pub fn switch_to_stream(&mut self, timeout: Duration) -> Result<Vec<CtrlEvent>, LanError> {
+        if !self.link.switch_to_stream()? {
+            return Ok(Vec::new());
+        }
+        let deadline = Instant::now() + timeout;
+        let mut others = Vec::new();
+        loop {
+            for e in self.drain()? {
+                if e == CtrlEvent::SwitchToStreamConnection {
+                    return Ok(others);
+                }
+                others.push(e);
+            }
+            let Some(left) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else {
+                return Err(LanError::Timeout("switch to stream connection ack"));
+            };
+            self.read_some(left)?;
+        }
     }
 
     /// Reads what has arrived within `timeout` and returns the messages, having already answered any
