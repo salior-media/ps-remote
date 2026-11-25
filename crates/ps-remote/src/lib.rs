@@ -5,4 +5,5 @@
 pub mod api;
 pub mod bridge;
 pub mod input;
+pub mod rate;
 pub mod runner;

@@ -179,3 +179,13 @@ async fn play_over_psn_needs_the_token_and_says_when_it_is_off() {
     assert_eq!(code, 503, "{body}");
     assert!(body.contains("PSN_RP_CLIENT_SECRET"), "{body}");
 }
+
+#[tokio::test]
+async fn the_psn_console_list_needs_the_token_and_says_when_it_is_off() {
+    let s = server().await;
+    let host = format!("127.0.0.1:{}", s.port);
+    let (code, _) = request(s.port, "GET", "/api/psn-consoles", &host, None, "").await;
+    assert_eq!(code, 401);
+    let (code, body) = request(s.port, "GET", "/api/psn-consoles", &host, Some(&s.token), "").await;
+    assert_eq!(code, 503, "{body}");
+}

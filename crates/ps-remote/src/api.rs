@@ -95,6 +95,7 @@ pub fn router(service: Arc<Service>) -> Router {
         .route("/consoles", get(consoles))
         .route("/play", post(play))
         .route("/play-psn", post(play_psn))
+        .route("/psn-consoles", get(psn_consoles))
         .route("/offer", post(offer))
         .route("/stop", post(stop))
         .route("/status", get(status))
@@ -291,6 +292,52 @@ async fn play(State(s): State<Arc<Service>>, axum::Json(req): axum::Json<PlayReq
         }
         Ok(Err(e)) => refuse_owned(StatusCode::BAD_GATEWAY, format!("the session did not start: {e}")),
         Err(_) => refuse(StatusCode::INTERNAL_SERVER_ERROR, "the session start failed"),
+    }
+}
+
+/// One of the PSN account's consoles, as `GET /api/psn-consoles` lists it: no device ID.
+#[derive(Serialize)]
+struct PsnConsoleInfo {
+    name: String,
+    remote_play: bool,
+    /// The one `/api/play-psn` plays. The others are home network only.
+    plays_over_psn: bool,
+}
+
+/// The PSN account's consoles (`docs/PSN.md`), from Sony: each call refreshes the saved sign-in, so it takes
+/// the start slot, and is refused while a start runs, as a second start would be.
+async fn psn_consoles(State(s): State<Arc<Service>>) -> Response {
+    let Some(psn) = s.psn.as_ref() else {
+        return refuse(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "playing over PSN needs PSN_RP_CLIENT_SECRET set when the service starts",
+        );
+    };
+    let Some(starting) = Starting::take(&s) else {
+        return refuse(StatusCode::CONFLICT, "a session is starting");
+    };
+    let (secret, dir) = (psn.app_secret.clone(), psn.config_dir.clone());
+    let listed = tokio::task::spawn_blocking(move || {
+        let _starting = starting;
+        psr_psn::play::account_consoles(&secret, &dir)
+    })
+    .await;
+    match listed {
+        Ok(Ok(list)) => {
+            let chosen = psr_psn::play::chosen(&list);
+            let info: Vec<PsnConsoleInfo> = list
+                .iter()
+                .enumerate()
+                .map(|(i, d)| PsnConsoleInfo {
+                    name: psr_psn::printable(&d.name),
+                    remote_play: d.remote_play,
+                    plays_over_psn: chosen == Some(i),
+                })
+                .collect();
+            axum::Json(info).into_response()
+        }
+        Ok(Err(e)) => refuse_owned(StatusCode::BAD_GATEWAY, format!("PSN's console list: {e}")),
+        Err(_) => refuse(StatusCode::INTERNAL_SERVER_ERROR, "PSN's console list failed"),
     }
 }
 

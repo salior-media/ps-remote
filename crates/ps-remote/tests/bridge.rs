@@ -130,7 +130,7 @@ fn input_comes_back_and_bad_input_is_named() {
     ch.write(false, br#"{"buttons":65536}"#).unwrap();
     run(&mut bridge, &mut browser, &mut events, |_, _, ev| ev.contains(&BridgeEvent::BadInput));
     let inputs: Vec<_> =
-        events.iter().filter_map(|e| if let BridgeEvent::Input(s) = e { Some(*s) } else { None }).collect();
+        events.iter().filter_map(|e| if let BridgeEvent::Input(i) = e { Some(i.state) } else { None }).collect();
     assert_eq!(inputs.len(), 1);
     assert_eq!((inputs[0].buttons, inputs[0].left_x), (button::DPAD_DOWN, -100));
 }

@@ -18,6 +18,8 @@ use serde::Serialize;
 use str0m::change::{SdpAnswer, SdpOffer};
 
 use crate::bridge::{Bridge, BridgeEvent};
+use crate::input::Touchpad;
+use crate::rate::Rate;
 
 /// How long one round of the loop waits for the console's datagrams. Short, because the browser's side is
 /// served in the same loop.
@@ -36,6 +38,8 @@ pub struct Status {
     pub frames_lost: u64,
     pub audio_frames: u64,
     pub datagrams_dropped: u64,
+    /// Video and audio received over the last second, in kilobits a second.
+    pub bitrate_kbps: u64,
     pub bad_input: u64,
     /// Why the session ended, once it has.
     pub ended: Option<String>,
@@ -118,14 +122,25 @@ fn spawn(
     media_ip: IpAddr,
     psn: Option<psr_psn::play::Leaver>,
 ) -> Result<Handle, String> {
+    let touchpad = Touchpad::new(ctrl.target().is_ps5());
     let (tx, rx) = mpsc::channel();
     let status = Arc::new(Mutex::new(Status { running: true, ..Status::default() }));
     let thread_status = Arc::clone(&status);
     let thread = std::thread::Builder::new()
         .name("ps-remote session".into())
         .spawn(move || {
-            let mut s =
-                Loop { ctrl, stream, media_ip, rx, status: thread_status, bridge: None, header: Vec::new(), psn };
+            let mut s = Loop {
+                ctrl,
+                stream,
+                media_ip,
+                rx,
+                status: thread_status,
+                bridge: None,
+                header: Vec::new(),
+                psn,
+                touchpad,
+                rate: Rate::new(Instant::now()),
+            };
             // Whatever happens in the loop, even a panic, the console is told the stream ended and the
             // status says so; otherwise the console could hold a session the API thinks is gone.
             let ended = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.run())) {
@@ -172,6 +187,9 @@ struct Loop {
     header: Vec<u8>,
     /// Over PSN, what leaves Sony's session; dropped after the stream ends.
     psn: Option<psr_psn::play::Leaver>,
+    /// The browser's fingers, kept on the console's touch ids from one input message to the next.
+    touchpad: Touchpad,
+    rate: Rate,
 }
 
 impl Loop {
@@ -202,9 +220,12 @@ impl Loop {
             }
             self.browser()?;
             let (lost, dropped) = (self.stream.frames_lost(), self.stream.dropped());
+            self.rate.roll(Instant::now());
+            let kbps = self.rate.kbps();
             self.update(|s| {
                 s.frames_lost = lost;
                 s.datagrams_dropped = dropped;
+                s.bitrate_kbps = kbps;
             });
         }
     }
@@ -236,12 +257,14 @@ impl Loop {
         match e {
             StreamEvent::Video(VideoEvent::Header { data, .. }) => self.header = data,
             StreamEvent::Video(VideoEvent::Frame(f)) => {
+                self.rate.add(f.data.len(), now);
                 self.update(|s| s.frames += 1);
                 if let Some(b) = self.bridge.as_mut() {
                     b.send_video(&self.header, &f.data, now).map_err(|e| e.to_string())?;
                 }
             }
             StreamEvent::Audio(a) => {
+                self.rate.add(a.data.len(), now);
                 self.update(|s| s.audio_frames += 1);
                 if let Some(b) = self.bridge.as_mut() {
                     b.send_audio(a.index, frame_size, &a.data, now).map_err(|e| e.to_string())?;
@@ -269,7 +292,11 @@ impl Loop {
                     self.stream.request_keyframe().map_err(|e| e.to_string())?;
                 }
                 BridgeEvent::KeyframeRequested => self.stream.request_keyframe().map_err(|e| e.to_string())?,
-                BridgeEvent::Input(state) => self.stream.set_controller_state(&state).map_err(|e| e.to_string())?,
+                BridgeEvent::Input(input) => {
+                    let mut state = input.state;
+                    (state.touches, state.touch_id_next) = self.touchpad.apply(&input.fingers);
+                    self.stream.set_controller_state(&state).map_err(|e| e.to_string())?;
+                }
                 BridgeEvent::BadInput => self.update(|s| s.bad_input += 1),
                 BridgeEvent::Closed => {
                     self.bridge = None;
@@ -284,6 +311,7 @@ impl Loop {
 
     /// Lets go of every button, so nothing stays held when a browser goes away.
     fn release_input(&mut self) -> Result<(), String> {
+        self.touchpad.clear();
         self.stream.set_controller_state(&ControllerState::default()).map_err(|e| e.to_string())
     }
 

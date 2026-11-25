@@ -18,7 +18,9 @@ play UI (the games scope's phase G2), which is not built. So step 8 is split:
    browser's WebRTC offer.
 2. **One session at a time**, on its own thread: the session and stream from `psr-lan`, the frames from `psr-av`,
    input through `psr-input`, and a `str0m` WebRTC peer that sends the video and audio to the browser and takes its
-   input from a data channel.
+   input from a data channel. The input message carries buttons, triggers and sticks, and up to two touchpad
+   fingers (`touches`, each `{"id", "x", "y"}` with `x` and `y` from 0 to 1); the test page makes the picture the
+   touchpad, as chiaki-ng makes its stream window, and a gamepad's touchpad press is its button 17.
 
 Nothing is decoded or re-encoded (port map §3):
 - **Video:** the console's H.264 frames go into the WebRTC video track as they are. Each frame is sent with the codec
@@ -39,11 +41,12 @@ takes it off the address bar once read. The page itself holds no token, because 
 |---|---|
 | `GET /` | the test page: a video element, and a gamepad sent as input |
 | `GET /api/consoles` | the linked consoles (the saved registrations), without keys |
+| `GET /api/psn-consoles` | the PSN account's consoles from Sony (name, Remote Play on or off, and which one `/api/play-psn` plays; the others are home network only). No device IDs. Each call refreshes the saved sign-in, so it takes the start slot (409 while a start runs); 503 without `PSN_RP_CLIENT_SECRET` |
 | `POST /api/play` | `{"host": "<console IPv4>"}` starts a session with the linked console there, once that address answers discovery as that console. One session, and one start, at a time |
 | `POST /api/play-psn` | No body. Plays the PSN account's first console with Remote Play on, from away, through Sony's servers and two punched holes (`docs/PSN.md`, 9c-3b); around 30 to 40 s. Needs `PSN_RP_CLIENT_SECRET` in the service's environment when it starts (kept in memory only) and a saved sign-in (`ps-remote signin`); otherwise 503. Same one-at-a-time rules as `/api/play`; the browser then connects with `/api/offer` as for a home session |
 | `POST /api/offer` | the browser's SDP offer, answered with the service's SDP answer |
 | `POST /api/stop` | ends the session |
-| `GET /api/status` | whether a session runs, and its frame, loss and drop counts |
+| `GET /api/status` | whether a session runs, its frame, loss and drop counts, and `bitrate_kbps`: the video and audio received over the last second. Delay is not reported: chiaki-ng measures it with Senkusha, which this port skips |
 
 **Input** on the data channel `input` is a JSON object per change: `buttons` (psr-input's bits), `l2` and `r2`
 (0 to 255), and `lx`, `ly`, `rx` and `ry` (−32768 to 32767). The service checks each field's range and drops a message
