@@ -263,6 +263,8 @@ fn counters_compare_round_the_wrap() {
 
 #[test]
 fn the_send_buffer_holds_sixteen_until_acknowledged() {
+    // chiaki-ng's `RUDP_SEND_BUFFER_SIZE`.
+    assert_eq!(rudp::SEND_BUFFER_SIZE, 16);
     let now = Instant::now();
     let mut b = rudp::SendBuffer::default();
     for i in 0..rudp::SEND_BUFFER_SIZE as u16 {
@@ -284,15 +286,16 @@ fn what_is_not_acknowledged_is_resent_every_400_ms_then_given_up() {
     let start = Instant::now();
     let mut b = rudp::SendBuffer::default();
     b.push(7, vec![7], start).unwrap();
-    assert!(b.due(start + rudp::RESEND_TIMEOUT).is_empty(), "not before the timeout has passed");
+    assert_eq!(b.due(start + rudp::RESEND_TIMEOUT), (vec![], false), "not before the timeout has passed");
     let mut t = start;
     for _ in 0..rudp::RESEND_TRIES_MAX {
         t += rudp::RESEND_TIMEOUT + Duration::from_millis(1);
-        assert_eq!(b.due(t), [vec![7]]);
-        assert!(b.due(t).is_empty(), "sent again only after another timeout");
+        assert_eq!(b.due(t), (vec![vec![7]], false));
+        assert_eq!(b.due(t), (vec![], false), "sent again only after another timeout");
     }
     t += rudp::RESEND_TIMEOUT + Duration::from_millis(1);
-    assert!(b.due(t).is_empty() && b.is_empty(), "dropped after the last try");
+    assert_eq!(b.due(t), (vec![], true), "given up on after the last try, and said so");
+    assert!(b.is_empty());
 }
 
 /// A ctrl frame: payload length, type, two zero bytes, payload.
@@ -310,7 +313,18 @@ fn each_kind_of_message_is_read_as_chiaki_ngs_ctrl_loop_reads_it() {
     let f = frame(0x30, b"hi");
     // A plain CTRL_MESSAGE: counter, frame. Acknowledged with the counter after it.
     let got = rudp::incoming(&[m(rudp::CTRL_MESSAGE, [&[0x00, 0x09][..], &f].concat())]);
-    assert_eq!(got, rudp::Incoming { acked: vec![], ack: Some(0x0A), frames: f.clone(), finished: false });
+    assert_eq!(
+        got,
+        rudp::Incoming { counter: Some(0x09), acked: vec![], ack: Some(0x0A), frames: f.clone(), finished: false }
+    );
+    assert!(!format!("{got:?}").contains("104"), "no frame bytes in Debug: {got:?}");
+    // A frame longer than ctrl's 512 bytes is not taken; the datagram is still acknowledged.
+    let big = frame(0x30, &[0; 600]);
+    let got = rudp::incoming(&[m(rudp::CTRL_MESSAGE, [&[0x00, 0x09][..], &big].concat())]);
+    assert_eq!((got.ack, got.frames.len()), (Some(0x0A), 0));
+    let longest = frame(0x30, &[0; psr_lan::ctrl::MAX_FRAME - 8]);
+    let got = rudp::incoming(&[m(rudp::CTRL_MESSAGE, [&[0x00, 0x09][..], &longest].concat())]);
+    assert_eq!(got.frames.len(), psr_lan::ctrl::MAX_FRAME);
     // OFFSET8 and OFFSET10 carry an acknowledgment of ours at 2, and the frame at 8 and 6.
     let got = rudp::incoming(&[m(rudp::OFFSET8, [&[0, 1, 0x12, 0x35, 9, 9, 9, 9][..], &f].concat())]);
     assert_eq!((got.acked, got.ack, got.frames), (vec![0x1235], Some(2), f.clone()));
@@ -321,7 +335,10 @@ fn each_kind_of_message_is_read_as_chiaki_ngs_ctrl_loop_reads_it() {
     assert_eq!((got.acked, got.ack, got.frames.len()), (vec![0x1237], None, 0));
     assert!(rudp::incoming(&[m(rudp::FINISH, vec![])]).finished);
     // Too short for its counters: passed over. A frame whose length is not the rest: not taken.
-    assert_eq!(rudp::incoming(&[m(rudp::CTRL_MESSAGE, vec![0, 1, 2])]), rudp::Incoming::default());
+    assert_eq!(
+        rudp::incoming(&[m(rudp::CTRL_MESSAGE, vec![0, 1, 2])]),
+        rudp::Incoming { counter: Some(1), ..Default::default() }
+    );
     let mut wrong = f.clone();
     wrong[3] = 3;
     let got = rudp::incoming(&[m(rudp::CTRL_MESSAGE, [&[0, 1][..], &wrong].concat())]);
@@ -374,4 +391,85 @@ fn ctrl_over_the_hole_is_acknowledged_and_resent_until_acknowledged() {
     // FINISH ends ctrl.
     console.send_to(&rudp::serialize(&[(rudp::FINISH, &[])]), from).unwrap();
     assert!(matches!(r.read_ctrl(Duration::from_secs(2)), Err(PsnError::Finished)));
+}
+
+#[test]
+fn our_message_waits_for_the_counter_after_its_own() {
+    let (client, console) = pair();
+    let mut r = Rudp::with(client, COUNTER, HEADER);
+    r.send_ctrl(b"x").unwrap();
+    let (_, from) = recv(&console);
+    // An acknowledgment naming our counter itself retires nothing: the console names the one after.
+    let ack = |seq: u16| rudp::serialize(&[(rudp::ACK, &[&[0, 1][..], &seq.to_be_bytes(), &[0, 0x92]].concat())]);
+    console.send_to(&ack(COUNTER), from).unwrap();
+    assert!(r.read_ctrl(Duration::from_millis(150)).unwrap().is_empty());
+    assert_eq!(r.unacknowledged(), 1);
+    console.send_to(&ack(COUNTER + 1), from).unwrap();
+    assert!(r.read_ctrl(Duration::from_millis(150)).unwrap().is_empty());
+    assert_eq!(r.unacknowledged(), 0);
+}
+
+#[test]
+fn a_full_buffer_refuses_before_sending_or_taking_a_counter() {
+    let (client, console) = pair();
+    let mut r = Rudp::with(client, COUNTER, HEADER);
+    for _ in 0..rudp::SEND_BUFFER_SIZE {
+        r.send_ctrl(b"x").unwrap();
+    }
+    let counter = r.counter();
+    assert!(matches!(r.send_ctrl(b"y"), Err(PsnError::Rudp(_))));
+    assert_eq!(r.counter(), counter, "no counter taken");
+    console.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+    let mut sent = 0;
+    while console.recv_from(&mut [0u8; 64]).is_ok() {
+        sent += 1;
+    }
+    assert_eq!(sent, rudp::SEND_BUFFER_SIZE, "the refused one was not sent");
+}
+
+#[test]
+fn a_datagram_read_once_is_acknowledged_again_but_not_read_again() {
+    let (client, console) = pair();
+    let mut r = Rudp::with(client, COUNTER, HEADER);
+    r.send_ctrl(b"x").unwrap();
+    let (_, from) = recv(&console);
+    let datagram = |counter: u16, ty: u16| {
+        rudp::serialize(&[(rudp::CTRL_MESSAGE, &[&counter.to_be_bytes()[..], &frame(ty, b"hi")].concat())])
+    };
+    console.send_to(&datagram(0x40, 0x30), from).unwrap();
+    assert_eq!(r.read_ctrl(Duration::from_secs(2)).unwrap(), frame(0x30, b"hi"));
+    // The same again, as when our ACK was lost, then an older one: both acknowledged, neither read.
+    console.send_to(&datagram(0x40, 0x31), from).unwrap();
+    console.send_to(&datagram(0x3F, 0x32), from).unwrap();
+    // The next one is read.
+    console.send_to(&datagram(0x41, 0x33), from).unwrap();
+    assert_eq!(r.read_ctrl(Duration::from_secs(2)).unwrap(), frame(0x33, b"hi"));
+    let acks: Vec<[u8; 2]> = std::iter::from_fn(|| {
+        console.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        let mut buf = [0u8; 64];
+        console.recv_from(&mut buf).ok().map(|(n, _)| rudp::parse(&buf[..n]))
+    })
+    .filter(|m| m[0].kind == rudp::ACK)
+    .map(|m| [m[0].data[2], m[0].data[3]])
+    .collect();
+    assert_eq!(acks, [[0x00, 0x41], [0x00, 0x41], [0x00, 0x40], [0x00, 0x42]]);
+}
+
+#[test]
+fn a_console_that_never_acknowledges_is_reported() {
+    let (client, _console) = pair();
+    let mut r = Rudp::with(client, COUNTER, HEADER);
+    r.send_ctrl(b"x").unwrap();
+    let begun = Instant::now();
+    // 25 resends, then once more past the timeout. Each comes up to one resend wake-up late, as chiaki-ng's
+    // resend thread's would: 10.4 to 15.6 s.
+    let limit = (rudp::RESEND_TIMEOUT + rudp::RESEND_WAKE) * (rudp::RESEND_TRIES_MAX + 2);
+    let got = loop {
+        match r.read_ctrl(Duration::from_millis(500)) {
+            Ok(f) if f.is_empty() && begun.elapsed() < limit => continue,
+            other => break other,
+        }
+    };
+    assert!(matches!(got, Err(PsnError::Rudp(_))), "{got:?} after {:?}", begun.elapsed());
+    assert!(begun.elapsed() >= rudp::RESEND_TIMEOUT * rudp::RESEND_TRIES_MAX, "{:?}", begun.elapsed());
 }
