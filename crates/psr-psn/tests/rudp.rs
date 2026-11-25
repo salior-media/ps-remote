@@ -245,3 +245,126 @@ fn a_messages_debug_shows_no_data() {
     assert!(d.contains("0x0230") && d.contains("len: 3"), "{d}");
     assert!(!d.contains("171") && !d.to_lowercase().contains("ab, "), "{d}");
 }
+
+#[test]
+fn a_ctrl_message_carries_our_counter_then_the_frames() {
+    let m = rudp::ctrl_message(COUNTER, &[1, 2, 3]);
+    assert_eq!(m, [0xC0, 0x0D, 0x24, 0x4F, 0x24, 0x4F, 0x02, 0x30, 0x12, 0x34, 1, 2, 3]);
+}
+
+#[test]
+fn counters_compare_round_the_wrap() {
+    assert!(rudp::seq_lt(1, 2) && !rudp::seq_lt(2, 1) && !rudp::seq_lt(5, 5));
+    assert!(rudp::seq_lt(0xFFFF, 0) && !rudp::seq_lt(0, 0xFFFF));
+    // Half the circle apart is neither, as chiaki-ng's has it.
+    assert!(!rudp::seq_lt(0, 0x8000) && !rudp::seq_lt(0x8000, 0));
+    assert!(rudp::seq_lt(0, 0x7FFF));
+}
+
+#[test]
+fn the_send_buffer_holds_sixteen_until_acknowledged() {
+    let now = Instant::now();
+    let mut b = rudp::SendBuffer::default();
+    for i in 0..rudp::SEND_BUFFER_SIZE as u16 {
+        b.push(0xFFF8u16.wrapping_add(i), vec![i as u8], now).unwrap();
+    }
+    assert!(b.push(100, vec![], now).is_err(), "full");
+    b.ack(0xFFFA);
+    assert_eq!(b.len(), rudp::SEND_BUFFER_SIZE - 3);
+    assert!(b.push(0xFFFB, vec![], now).is_err(), "a counter already waiting");
+    // Acknowledging past the wrap takes everything before it.
+    b.ack(2);
+    assert_eq!(b.len(), rudp::SEND_BUFFER_SIZE - 11);
+    b.ack(0xF000);
+    assert_eq!(b.len(), rudp::SEND_BUFFER_SIZE - 11, "an old acknowledgment retires nothing");
+}
+
+#[test]
+fn what_is_not_acknowledged_is_resent_every_400_ms_then_given_up() {
+    let start = Instant::now();
+    let mut b = rudp::SendBuffer::default();
+    b.push(7, vec![7], start).unwrap();
+    assert!(b.due(start + rudp::RESEND_TIMEOUT).is_empty(), "not before the timeout has passed");
+    let mut t = start;
+    for _ in 0..rudp::RESEND_TRIES_MAX {
+        t += rudp::RESEND_TIMEOUT + Duration::from_millis(1);
+        assert_eq!(b.due(t), [vec![7]]);
+        assert!(b.due(t).is_empty(), "sent again only after another timeout");
+    }
+    t += rudp::RESEND_TIMEOUT + Duration::from_millis(1);
+    assert!(b.due(t).is_empty() && b.is_empty(), "dropped after the last try");
+}
+
+/// A ctrl frame: payload length, type, two zero bytes, payload.
+fn frame(ty: u16, payload: &[u8]) -> Vec<u8> {
+    let mut f = (payload.len() as u32).to_be_bytes().to_vec();
+    f.extend(ty.to_be_bytes());
+    f.extend([0, 0]);
+    f.extend(payload);
+    f
+}
+
+#[test]
+fn each_kind_of_message_is_read_as_chiaki_ngs_ctrl_loop_reads_it() {
+    let m = |kind: u16, data: Vec<u8>| Message { kind, data };
+    let f = frame(0x30, b"hi");
+    // A plain CTRL_MESSAGE: counter, frame. Acknowledged with the counter after it.
+    let got = rudp::incoming(&[m(rudp::CTRL_MESSAGE, [&[0x00, 0x09][..], &f].concat())]);
+    assert_eq!(got, rudp::Incoming { acked: vec![], ack: Some(0x0A), frames: f.clone(), finished: false });
+    // OFFSET8 and OFFSET10 carry an acknowledgment of ours at 2, and the frame at 8 and 6.
+    let got = rudp::incoming(&[m(rudp::OFFSET8, [&[0, 1, 0x12, 0x35, 9, 9, 9, 9][..], &f].concat())]);
+    assert_eq!((got.acked, got.ack, got.frames), (vec![0x1235], Some(2), f.clone()));
+    let got = rudp::incoming(&[m(rudp::OFFSET10, [&[0, 1, 0x12, 0x36, 9, 9][..], &f].concat())]);
+    assert_eq!((got.acked, got.frames), (vec![0x1236], f.clone()));
+    // ACK: an acknowledgment only. FINISH: the end, even with no data.
+    let got = rudp::incoming(&[m(rudp::ACK, vec![0, 1, 0x12, 0x37, 0, 0x92])]);
+    assert_eq!((got.acked, got.ack, got.frames.len()), (vec![0x1237], None, 0));
+    assert!(rudp::incoming(&[m(rudp::FINISH, vec![])]).finished);
+    // Too short for its counters: passed over. A frame whose length is not the rest: not taken.
+    assert_eq!(rudp::incoming(&[m(rudp::CTRL_MESSAGE, vec![0, 1, 2])]), rudp::Incoming::default());
+    let mut wrong = f.clone();
+    wrong[3] = 3;
+    let got = rudp::incoming(&[m(rudp::CTRL_MESSAGE, [&[0, 1][..], &wrong].concat())]);
+    assert_eq!((got.ack, got.frames.len()), (Some(2), 0), "acknowledged, not taken");
+    // An unknown kind: acknowledged, retires nothing, its frame at 4.
+    let got = rudp::incoming(&[m(0x5530, [&[0, 1, 0x77, 0x77][..], &f].concat())]);
+    assert_eq!((got.acked.len(), got.ack, got.frames), (0, Some(2), f.clone()));
+    // In a chain, the acknowledgment names the first message's counter, and frames come in order.
+    let g = frame(0x31, b"yo");
+    let got = rudp::incoming(&[
+        m(rudp::OFFSET8, [&[0, 0x20, 0x12, 0x38, 9, 9, 9, 9][..], &f].concat()),
+        m(rudp::CTRL_MESSAGE, [&[0, 0x30][..], &g].concat()),
+    ]);
+    assert_eq!((got.ack, got.frames), (Some(0x21), [f, g].concat()));
+}
+
+#[test]
+fn ctrl_over_the_hole_is_acknowledged_and_resent_until_acknowledged() {
+    let (client, console) = pair();
+    let mut r = Rudp::with(client, COUNTER, HEADER);
+    // Ours, unacknowledged: sent, then sent again after the resend timeout while we read.
+    r.send_ctrl(b"frames").unwrap();
+    let (first, from) = recv(&console);
+    assert_eq!(first[0].data, [&COUNTER.to_be_bytes()[..], b"frames"].concat());
+    let begun = Instant::now();
+    assert!(r.read_ctrl(rudp::RESEND_TIMEOUT + rudp::RESEND_WAKE * 2).unwrap().is_empty());
+    let (again, _) = recv(&console);
+    assert_eq!(again, first);
+    assert!(begun.elapsed() >= rudp::RESEND_TIMEOUT);
+    // The console's message acknowledges it (the counter after ours) and carries a frame.
+    let f = frame(0x30, b"hi");
+    let theirs = rudp::serialize(&[(rudp::OFFSET10, &[&[0x40, 0x00, 0x12, 0x35, 0, 0][..], &f].concat())]);
+    console.send_to(&theirs, from).unwrap();
+    assert_eq!(r.read_ctrl(Duration::from_secs(2)).unwrap(), f);
+    assert_eq!(r.unacknowledged(), 0);
+    let (ack, _) = recv(&console);
+    assert_eq!(ack[0].kind, rudp::ACK);
+    assert_eq!(&ack[0].data[2..4], &[0x40, 0x01]);
+    // Nothing more is resent.
+    assert!(r.read_ctrl(rudp::RESEND_TIMEOUT * 2).unwrap().is_empty());
+    console.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+    assert!(console.recv_from(&mut [0u8; 64]).is_err());
+    // FINISH ends ctrl.
+    console.send_to(&rudp::serialize(&[(rudp::FINISH, &[])]), from).unwrap();
+    assert!(matches!(r.read_ctrl(Duration::from_secs(2)), Err(PsnError::Finished)));
+}

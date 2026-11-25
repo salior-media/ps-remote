@@ -1,0 +1,93 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! Starting a session over PSN: the session request, then ctrl, both through the punched control hole.
+//! Ported from chiaki-ng `lib/src/session.c` (`session_thread_request_session`) and `lib/src/ctrl.c`
+//! (`ctrl_connect`), their `rudp` paths (LicenseRef-AGPL-3.0-only-OpenSSL).
+//!
+//! The requests are the home network's (`psr_lan::session`, `psr_lan::ctrl`), with `Host` naming the
+//! console's end of the hole, each sent over RUDP after its own handshake. Once ctrl's answer is in, the
+//! home network's [`Session`] takes over, on the hole ([`Rudp`] is its link), and also sends a heartbeat reply
+//! every [`HEARTBEAT_EVERY`] once the console has asked for one, as chiaki-ng does over RUDP.
+//!
+//! chiaki-ng's other RUDP quirk is kept: for a PS5, the ctrl cipher's local counter skips one after the
+//! request (`ctrl_connect`'s `crypt_counter_local++` under `session->rudp`).
+
+use std::net::SocketAddrV4;
+use std::time::Duration;
+
+use psr_crypto::Target;
+use psr_crypto::rpcrypt::RpCrypt;
+use psr_lan::ctrl::{self, CtrlCipher};
+use psr_lan::regist::RegisteredHost;
+use psr_lan::session::{self as lan, Codec, Session};
+
+use crate::PsnError;
+use crate::rudp::Rudp;
+
+/// chiaki-ng `CTRL_RUDP_HEARTBEAT_REP_INTERVAL_MS`.
+pub const HEARTBEAT_EVERY: Duration = Duration::from_millis(4950);
+/// chiaki-ng: "PS4 doesn't always react right away, sleep a bit".
+const BEFORE_CTRL_DELAY: Duration = Duration::from_millis(10);
+
+/// An answer split at the end of its HTTP header (which [`Rudp::http`] has checked is there).
+fn split(answer: &[u8]) -> (&[u8], &[u8]) {
+    let end = psr_lan::http::header_end(answer).unwrap_or(answer.len());
+    answer.split_at(end)
+}
+
+/// One session request over the hole: the handshake, the request, then ACK and FINISH (chiaki-ng carries on
+/// without FINISH).
+fn request_nonce(rudp: &mut Rudp, target: Target, console: SocketAddrV4, key: &[u8; 16]) -> Result<[u8; 16], PsnError> {
+    let request =
+        lan::session_request_port(target, &console.ip().to_string(), console.port(), key).map_err(PsnError::Lan)?;
+    let mut remote = rudp.handshake()?;
+    let answer = rudp.http(&mut remote, request.as_bytes())?;
+    let _ = rudp.finish(remote);
+    lan::parse_session_response(split(&answer).0).map_err(PsnError::Lan)
+}
+
+/// chiaki-ng's session start over PSN, up to ctrl's session ID: `rudp` is the control hole's, `console` the
+/// address it is connected to, and `host` the console as registered (9c-1 does that through the hole too).
+pub fn start(
+    mut rudp: Rudp,
+    console: SocketAddrV4,
+    host: &RegisteredHost,
+    codec: Codec,
+    did: &[u8; 32],
+) -> Result<Session, PsnError> {
+    let key = &host.rp_regist_key;
+    // As at home: asked up to three times, following the console's RP-Version each time it names a new one.
+    let mut target = host.target;
+    let mut nonce = request_nonce(&mut rudp, target, console, key);
+    for _ in 0..2 {
+        let Some(next) = nonce.as_ref().err().and_then(|e| match e {
+            PsnError::Lan(e) => lan::retry_target(e, target),
+            _ => None,
+        }) else {
+            break;
+        };
+        target = next;
+        nonce = request_nonce(&mut rudp, target, console, key);
+    }
+    let nonce = nonce?;
+    let mut cipher = CtrlCipher::new(RpCrypt::auth(target, &nonce, &host.rp_key).map_err(|e| PsnError::Lan(e.into()))?);
+    std::thread::sleep(BEFORE_CTRL_DELAY);
+
+    let request =
+        ctrl::ctrl_request_port(target, &console.ip().to_string(), console.port(), &mut cipher, key, did, codec)
+            .map_err(PsnError::Lan)?;
+    if target.is_ps5() {
+        cipher.set_local(cipher.local() + 1);
+    }
+    let mut remote = rudp.handshake()?;
+    // chiaki-ng sends the ctrl request once more when the first goes unanswered.
+    let answer = match rudp.http(&mut remote, request.as_bytes()) {
+        Err(PsnError::Timeout(_)) => rudp.http(&mut remote, request.as_bytes())?,
+        other => other?,
+    };
+    // chiaki-ng acknowledges the answer and does not wait for FINISH: ctrl goes on over the same exchange.
+    rudp.send_ack(remote)?;
+    let (head, rest) = split(&answer);
+    let response = ctrl::parse_ctrl_response(head, &mut cipher).map_err(PsnError::Lan)?;
+    let rest = rest.to_vec();
+    Session::over(Box::new(rudp), target, cipher, &rest, response, Some(HEARTBEAT_EVERY)).map_err(PsnError::Lan)
+}

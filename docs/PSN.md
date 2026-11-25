@@ -234,8 +234,40 @@ uses: a wrong value would have derived another cipher, and the console would hav
 
 **Not verified yet:** any of it from another network.
 
+**9c-2, the session and ctrl through the hole.** `crates/psr-psn/src/session.rs` sends the home network's session
+request and ctrl request through the hole, each after its own RUDP handshake, with `Host` naming the console's
+end of the hole. Ctrl then runs on the home network's `Session`, which now takes its frames from a link
+(`psr_lan::session::CtrlLink`): TCP at home, and the hole's RUDP over PSN, with RUDP's acknowledgments and the
+send buffer's resends (`rudpsendbuffer.c`: every 400 ms, up to 25 times, 16 at once). Two RUDP quirks of
+chiaki-ng's are kept: for a PS5 the ctrl cipher's local counter skips one after the request, and a heartbeat reply
+goes out unasked every 4.95 s once the console has asked for one. Differences from chiaki-ng, in `rudp.rs`'s
+header: one ACK per datagram rather than per message, and the resends are made by the ctrl loop as it reads, in
+steps of chiaki-ng's 200 ms resend wake-up, rather than by a thread.
+
+**9c-2 against the household's PS5 (2026-11-25), on the LAN:**
+1. After registration, the session request was answered, ctrl's 83 ms later, and the console's login result
+   57 ms after that. The data hole's offer came, and the data hole was punched through the console's `LOCAL`
+   candidate 16.8 s after ctrl was up, with ctrl answered on a thread meanwhile: 4 heartbeat requests answered,
+   2 other messages, and ctrl still up 12 s later.
+2. **The console sent no session ID** in the 10 s it is given. chiaki-ng waits the same 10 s and then makes its
+   fallback ID, and so does the port (at home the PS5 sends one, in a form chiaki-ng's rules refuse, so the
+   fallback is used there too). The 10 s is the whole of the gap between registration and ctrl being up.
+
+**Found while verifying 9c-2: on Windows, an answer arriving as a receive times out can be lost.** The punch test
+`only_a_request_makes_a_derived_candidate` failed 6 runs in 20. Its stand-in console answered 1.5 s after the
+first request, exactly when one of our 500 ms receive timeouts runs out. Answering 250 ms off that boundary, it
+passed 20 in 20, and the junk datagram the test also sends made no difference (6 in 20 without it). With the
+answer printed as it was received, the failure stopped appearing at all, which is what a race would do. A first
+guess, that the stand-in's socket closing cost the answer, was wrong: keeping it open still failed 6 in 20.
+A second test, `an_address_at_an_ip_not_offered_is_passed_over`, failed the same way in a full run: its console answered 500 ms in, on the boundary again. Microsoft's documentation does not describe such a loss, so it stands only on these runs. Both tests now answer
+off the boundary (the punch suite then passed 12 runs in 12); **every UDP wait in psr-psn (STUN, the punch, RUDP) receives with timeouts the same way**, so a
+real answer could be lost the same way. The resends recover from it so far, but it is not fixed.
+
+**Not verified yet:** any of it from another network; the data hole's use (the stream over it is 9c-3).
+
 ## What 9a does not do yet
 
 9a doesn't wake a console over PSN, run the holepunch session, or carry any media. 9b-1 adds the session's control
 plane, 9b-2a wakes the console and reads its offer, and 9b-2b punches the control hole. 9c-1 runs RUDP over that
-hole and registers through it; the session request, ctrl, the data hole and the stream are 9c-2 and 9c-3.
+hole and registers through it; 9c-2 runs the session request and ctrl through it and punches the data hole; the
+stream over the data hole is 9c-3.

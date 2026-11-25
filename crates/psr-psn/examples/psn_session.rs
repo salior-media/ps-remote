@@ -4,9 +4,9 @@
 //!
 //! With `--start`, it then starts remote play on the account's PS5 (the one with Remote Play on), waits for the
 //! console to join and send its `customData1`, punches the control hole, and registers through it (step
-//! 9c-1). It reports whether the console's keys match the ones saved when it was registered at home, never
-//! the keys. (The data hole comes later: the console offers it only once the control protocol runs over the
-//! control hole, step 9c-2.)
+//! 9c-1), reporting whether the console's keys match the ones saved when it was registered at home, never the
+//! keys. Then (step 9c-2) it starts the session and ctrl through the hole, and, with ctrl kept answered on a
+//! thread, punches the data hole, then keeps ctrl up for [`CTRL_HOLD`] to see the heartbeats go both ways.
 //!
 //! Either way it leaves the session at the end. It prints what happened: counts and kinds, never addresses,
 //! account IDs, or tokens.
@@ -14,13 +14,20 @@
 //!     PSN_RP_CLIENT_SECRET=... cargo run -p psr-psn --example psn_session [-- --start]
 
 use std::net::IpAddr;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+use psr_lan::ctrl::CtrlEvent;
+use psr_lan::session::{Codec, Session};
 
 use psr_crypto::Target;
 use psr_psn::holepunch;
 use psr_psn::punch::{Port, Puncher};
 use psr_psn::rudp::Rudp;
-use psr_psn::{auth, devices, push, regist, rps, secret};
+use psr_psn::{auth, devices, push, regist, rps, secret, session as psn_session};
+
+/// How long ctrl is kept up after the data hole, to see the heartbeats.
+const CTRL_HOLD: Duration = Duration::from_secs(12);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let with_start = std::env::args().any(|a| a == "--start");
@@ -67,6 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 hole.candidate.kind
             );
             let local_ip = hole.local_ip;
+            let console_addr = hole.console;
             let mut rudp = Rudp::new(hole.socket)?;
             let done = regist::register(&mut rudp, Target::Ps5V1, session.created.account_id, &started, local_ip)?;
             let consoles = dir.join("consoles");
@@ -78,6 +86,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let finished = if done.finished { "and finished" } else { "without the console's FINISH" };
             println!("{}  registered through the hole {finished}; its keys {same} the ones saved at home", t());
+
+            let did = psr_lan::session::did(&holepunch::random_bytes()?);
+            let mut ctrl = psn_session::start(rudp, console_addr, &done.host, Codec::H264, &did)?;
+            let id = if ctrl.session_id_was_fallback() { "chiaki-ng's fallback" } else { "the console's" };
+            println!("{}  session started and ctrl up through the hole; session ID: {id}", t());
+
+            let stop = AtomicBool::new(false);
+            let (data, counts) = std::thread::scope(|scope| {
+                let poller = scope.spawn(|| keep_answering(&mut ctrl, &stop));
+                let data = puncher.punch(&mut ws, Port::Data);
+                if data.is_ok() {
+                    std::thread::sleep(CTRL_HOLD);
+                }
+                stop.store(true, Ordering::Relaxed);
+                (data, poller.join())
+            });
+            let counts = counts.map_err(|_| psr_psn::PsnError::Rudp("the ctrl thread panicked"))?;
+            let data = data?;
+            println!("{}  Data hole punched at the console's {:?} candidate", t(), data.candidate.kind);
+            println!(
+                "{}  ctrl over the hole: {} heartbeat requests answered, {} other messages, {}",
+                t(),
+                counts.heartbeats,
+                counts.other,
+                counts.ended.unwrap_or("still up")
+            );
         }
         Ok(())
     })();
@@ -87,6 +121,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ws.close();
     outcome?;
     Ok(())
+}
+
+#[derive(Default)]
+struct Counts {
+    heartbeats: usize,
+    other: usize,
+    ended: Option<&'static str>,
+}
+
+/// Polls ctrl until told to stop, counting what comes: names and counts only, never payloads.
+fn keep_answering(ctrl: &mut Session, stop: &AtomicBool) -> Counts {
+    let mut c = Counts::default();
+    while !stop.load(Ordering::Relaxed) {
+        match ctrl.poll(Duration::from_millis(200)) {
+            Ok(events) => {
+                for e in events {
+                    match e {
+                        CtrlEvent::HeartbeatRequested => c.heartbeats += 1,
+                        _ => c.other += 1,
+                    }
+                }
+            }
+            Err(psr_lan::LanError::CtrlClosed) => {
+                c.ended = Some("then the console closed it");
+                break;
+            }
+            Err(_) => {
+                c.ended = Some("then it failed");
+                break;
+            }
+        }
+    }
+    c
 }
 
 fn private(ip: IpAddr) -> bool {

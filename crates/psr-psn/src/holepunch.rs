@@ -40,6 +40,11 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// Sixteen random bytes from the system's generator, as the device ID wants.
+pub fn random_bytes() -> Result<[u8; 16], PsnError> {
+    random()
+}
+
 pub(crate) fn random<const N: usize>() -> Result<[u8; N], PsnError> {
     let mut b = [0u8; N];
     getrandom::fill(&mut b).map_err(|e| PsnError::Network(format!("random numbers: {e}")))?;

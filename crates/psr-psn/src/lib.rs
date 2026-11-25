@@ -11,6 +11,7 @@ pub mod push;
 pub mod regist;
 pub mod rps;
 pub mod rudp;
+pub mod session;
 pub mod secret;
 pub mod stun;
 
@@ -41,6 +42,9 @@ pub enum PsnError {
     /// The console's RUDP answer was not what the exchange needs.
     #[error("RUDP: {0}")]
     Rudp(&'static str),
+    /// The console sent RUDP's FINISH where ctrl was running: it has closed the channel.
+    #[error("the console finished the ctrl channel")]
+    Finished,
     /// What the console said once the exchange reached it: a refused registration, a malformed answer.
     #[error(transparent)]
     Lan(psr_lan::LanError),
