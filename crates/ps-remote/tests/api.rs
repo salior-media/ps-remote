@@ -204,7 +204,7 @@ async fn link_checks_its_request_before_it_reaches_a_console() {
     let s = server().await;
     let s = &s;
     let link = |body: String| async move { post(s, "/api/link", &body).await };
-    for pin in ["1234567", "123456789", "1234abcd", "", "-1234567"] {
+    for pin in ["1234567", "123456789", "1234abcd", "", "-1234567", "+1234567"] {
         let (code, body) = link(format!(r#"{{"host":"127.0.0.1","pin":"{pin}","account_id":"{ACCOUNT}"}}"#)).await;
         assert_eq!(code, 400, "PIN {pin:?}: {body}");
         assert!(body.contains("8 digits"), "{body}");
