@@ -212,6 +212,13 @@ async fn link_checks_its_request_before_it_reaches_a_console() {
     }
     let (code, _) = link(format!(r#"{{"host":"::1","pin":"12345678","account_id":"{ACCOUNT}"}}"#)).await;
     assert_eq!(code, 400, "IPv6 is not searched");
+    let (code, body) = link(format!(r#"{{"host":"8.8.8.8","pin":"12345678","account_id":"{ACCOUNT}"}}"#)).await;
+    assert_eq!(code, 400, "an internet address is not searched: {body}");
+    assert!(body.contains("home network"), "{body}");
+    // A PIN sent as a number is refused without quoting it back.
+    let (code, body) = link(r#"{"host":"127.0.0.1","pin":87654321}"#.into()).await;
+    assert_eq!(code, 422, "{body}");
+    assert!(!body.contains("87654321"), "{body}");
     let (code, body) = link(r#"{"host":"127.0.0.1","pin":"12345678","account_id":"not base64!"}"#.into()).await;
     assert_eq!(code, 400, "{body}");
     let (code, body) = link(r#"{"host":"127.0.0.1","pin":"12345678"}"#.into()).await;
@@ -247,6 +254,9 @@ async fn wake_only_goes_where_the_console_answers_as_itself() {
     assert!(body.contains("did not answer as"), "{body}");
     let (code, _) = request(s.port, "POST", "/api/wake", &host, t, r#"{"host":"::1"}"#).await;
     assert_eq!(code, 400, "IPv6 is not searched");
+    let (code, body) = request(s.port, "POST", "/api/wake", &host, t, r#"{"host":"8.8.8.8"}"#).await;
+    assert_eq!(code, 400, "{body}");
+    assert!(body.contains("home network"), "the credential is never sent to the internet: {body}");
     let (code, _) = request(s.port, "POST", "/api/wake", &host, t, r#"{"host":"127.0.0.1","pin":"1"}"#).await;
     assert_eq!(code, 422, "unknown fields are refused");
 }

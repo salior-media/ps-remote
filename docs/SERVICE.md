@@ -45,7 +45,7 @@ takes it off the address bar once read. The page itself holds no token, because 
 | `POST /api/play` | `{"host": "<console IPv4>"}` starts a session with the linked console there, once that address answers discovery as that console. One session, and one start, at a time |
 | `POST /api/play-psn` | No body. Plays the PSN account's first console with Remote Play on, from away, through Sony's servers and two punched holes (`docs/PSN.md`, 9c-3b); around 30 to 40 s. Needs `PSN_RP_CLIENT_SECRET` in the service's environment when it starts (kept in memory only) and a saved sign-in (`ps-remote signin`); otherwise 503. Same one-at-a-time rules as `/api/play`; the browser then connects with `/api/offer` as for a home session |
 | `POST /api/link` | `{"host": "<console IPv4>", "pin": "<8 digits>"}`, with `"account_id"` (base64, as the `psn_account_id` example prints it) unless the service has PSN on and a saved sign-in, in which case it asks Sony. Links with the console that answers discovery there, with the PIN from its *Link Device* screen, and saves its keys as the `link` example does. Answers the console's nickname and MAC, never its keys. Takes the start slot (409 while a start runs) |
-| `POST /api/wake` | `{"host": "<console IPv4>"}` (and `"console"` when several are linked) wakes the linked console there from rest mode, once that address answers discovery as that console; the wake-up credential goes nowhere else. Answers `{"sent": true}` when it sent one, `{"sent": false}` when the console was already awake |
+| `POST /api/wake` | `{"host": "<console IPv4>"}` (and `"console"` when several are linked) wakes the linked console there from rest mode, once that address answers discovery as that console (a private address only). Answers `{"sent": true}` when it sent one, and `{"sent": false, "state": …}` when the console was not in rest mode |
 | `POST /api/offer` | the browser's SDP offer, answered with the service's SDP answer |
 | `POST /api/stop` | ends the session |
 | `GET /api/status` | whether a session runs, its frame, loss and drop counts, and `bitrate_kbps`: the video and audio received over the last second. The console-to-service delay is not reported: chiaki-ng's way to measure it (Senkusha) is compiled there but never switched on, as no build defines `ENABLE_SENKUSHA`. The test page shows the browser's share instead, from WebRTC's own counters: the browser-to-service round trip, and per frame the time buffered, decoding, and from received to shown |
@@ -68,8 +68,13 @@ the `link` example and waking had no route. Two routes add them, built from the 
   then `psr_lan::store::save`. The PSN account ID comes from the request, or from Sony using the saved sign-in
   (`psr_psn::auth::account_id`, chiaki-ng's `scripts/psn-account-id.py`). The PIN is checked to be 8 digits and is
   never logged or echoed.
-- **`/api/wake`** sends chiaki-ng's `WAKEUP` datagram (`psr_lan::discovery::wake`) only to an address that answered
-  discovery as that linked console, in rest mode, because the datagram carries the console's wake-up credential.
+- **`/api/wake`** sends chiaki-ng's `WAKEUP` datagram (`psr_lan::discovery::wake`) only to a private address that
+  answered discovery as that linked console, in rest mode, because the datagram carries the console's wake-up
+  credential. Discovery is unauthenticated UDP, so this check stops a mistake, not a liar: a device on the home
+  network that claims the console's ID gets the datagram, and anything that can watch the network can read it, as
+  with chiaki-ng. Play has the same limit.
+- **Linking saves only the console that answered.** The MAC in the registration reply must be the `host-id` the
+  address gave in discovery, so a device cannot answer as one console and replace another console's keys.
 
 game-play forwards both, and its PlayStation tab gets *Link a console* (address and PIN) and *Wake* controls.
 
