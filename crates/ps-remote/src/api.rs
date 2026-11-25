@@ -102,6 +102,10 @@ pub fn router(service: Arc<Service>) -> Router {
         .route("/stop", post(stop))
         .route("/link", post(link))
         .route("/wake", post(wake))
+        .route("/psn-status", get(psn_status))
+        .route("/psn-signin-url", get(psn_signin_url))
+        .route("/psn-signin", post(psn_signin))
+        .route("/psn-signout", post(psn_signout))
         .route("/status", get(status))
         .route_layer(middleware::from_fn_with_state(Arc::clone(&service), require_token));
     Router::new()
@@ -455,6 +459,104 @@ async fn play(State(s): State<Arc<Service>>, axum::Json(req): axum::Json<PlayReq
         }
         Ok(Err(e)) => refuse_owned(StatusCode::BAD_GATEWAY, format!("the session did not start: {e}")),
         Err(_) => refuse(StatusCode::INTERNAL_SERVER_ERROR, "the session start failed"),
+    }
+}
+
+const PSN_OFF: &str = "playing over PSN needs PSN_RP_CLIENT_SECRET set when the service starts";
+
+/// Whether playing over PSN is on, and whether a sign-in is saved (`docs/SERVICE.md`, step 8d). Only the file's
+/// presence is looked at: the sign-in is not opened, so one that no longer opens can still be replaced or forgotten.
+async fn psn_status(State(s): State<Arc<Service>>) -> Response {
+    let signed_in = s.psn.as_ref().is_some_and(|psn| psr_psn::secret::is_saved(&psn.config_dir));
+    axum::Json(serde_json::json!({ "available": s.psn.is_some(), "signed_in": signed_in })).into_response()
+}
+
+/// A running session keeps its own tokens, and may save a renewed refresh token when it ends
+/// (`psr_psn::play::Leave`). Signing in or out under it could be undone by that save, so both wait for it to end.
+fn session_running(s: &Service) -> bool {
+    s.session().as_ref().is_some_and(Handle::is_running)
+}
+
+/// Sony's sign-in page, with a new client device ID, as `ps-remote signin` prints it.
+async fn psn_signin_url(State(s): State<Arc<Service>>) -> Response {
+    if s.psn.is_none() {
+        return refuse(StatusCode::SERVICE_UNAVAILABLE, PSN_OFF);
+    }
+    match psr_psn::auth::client_duid() {
+        Ok(duid) => {
+            let mut r = axum::Json(serde_json::json!({ "url": psr_psn::auth::login_url(&duid) })).into_response();
+            r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            r
+        }
+        Err(e) => refuse_owned(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SigninRequest {
+    /// The address of Sony's redirect page, with the one-time code in it.
+    redirect: String,
+}
+
+/// Trades the code in Sony's redirect address for tokens and saves the refresh token, as `ps-remote signin`
+/// does. The address carries a one-time code, so it is never echoed: refusals are fixed sentences.
+async fn psn_signin(State(s): State<Arc<Service>>, body: Result<axum::Json<SigninRequest>, JsonRejection>) -> Response {
+    let Some(psn) = s.psn.as_ref() else {
+        return refuse(StatusCode::SERVICE_UNAVAILABLE, PSN_OFF);
+    };
+    // axum's own refusal quotes the value it could not read.
+    let req = match body {
+        Ok(axum::Json(req)) => req,
+        Err(rejected) => return refuse(rejected.status(), "the body is JSON: {\"redirect\": \"<address>\"}"),
+    };
+    let code = match psr_psn::auth::code_from_redirect(&req.redirect) {
+        Ok(code) => code,
+        // Both errors are fixed sentences that do not include the address.
+        Err(e) => return refuse_owned(StatusCode::BAD_REQUEST, e.to_string()),
+    };
+    let Some(starting) = Starting::take(&s) else {
+        return refuse(StatusCode::CONFLICT, "a session is starting");
+    };
+    if session_running(&s) {
+        return refuse(StatusCode::CONFLICT, "stop the session first: it would keep its own sign-in");
+    }
+    let (secret, dir) = (psn.app_secret.clone(), psn.config_dir.clone());
+    let done = tokio::task::spawn_blocking(move || {
+        let _starting = starting;
+        let tokens = psr_psn::auth::exchange_code(&secret, &code)?;
+        psr_psn::secret::save_refresh_token(&dir, &tokens.refresh)
+    })
+    .await;
+    match done {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(e)) => refuse_owned(StatusCode::BAD_GATEWAY, format!("signing in did not work: {e}")),
+        Err(_) => refuse(StatusCode::INTERNAL_SERVER_ERROR, "signing in failed"),
+    }
+}
+
+/// Forgets the saved sign-in here, as `ps-remote signout` does. It stays valid at Sony until it expires.
+async fn psn_signout(State(s): State<Arc<Service>>) -> Response {
+    // Without the app secret the saved sign-in's folder is not known here; saying 204 would claim it was forgotten.
+    let Some(psn) = s.psn.as_ref() else {
+        return refuse(StatusCode::SERVICE_UNAVAILABLE, PSN_OFF);
+    };
+    let Some(starting) = Starting::take(&s) else {
+        return refuse(StatusCode::CONFLICT, "a session is starting");
+    };
+    if session_running(&s) {
+        return refuse(StatusCode::CONFLICT, "stop the session first: it would keep its own sign-in");
+    }
+    let dir = psn.config_dir.clone();
+    let done = tokio::task::spawn_blocking(move || {
+        let _starting = starting;
+        psr_psn::secret::forget(&dir)
+    })
+    .await;
+    match done {
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(e)) => refuse_owned(StatusCode::INTERNAL_SERVER_ERROR, format!("signing out did not work: {e}")),
+        Err(_) => refuse(StatusCode::INTERNAL_SERVER_ERROR, "signing out failed"),
     }
 }
 

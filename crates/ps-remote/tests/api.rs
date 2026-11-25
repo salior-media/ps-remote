@@ -31,6 +31,19 @@ async fn server() -> Server {
     Server { port, token, dir: TempDir(dir) }
 }
 
+/// A server with playing over PSN on (a made-up app secret), its PSN sign-in kept in its own folder.
+async fn server_psn() -> Server {
+    let dir = std::env::temp_dir().join(format!("ps-remote-api-test-{}", api::new_token().unwrap()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let token = api::new_token().unwrap();
+    let psn = api::Psn { app_secret: "not-the-real-secret".into(), config_dir: dir.clone() };
+    let service = api::Service::with_psn(token.clone(), port, dir.clone(), Some(psn));
+    tokio::spawn(async move { axum::serve(listener, api::router(service)).await.unwrap() });
+    Server { port, token, dir: TempDir(dir) }
+}
+
 /// Sends one request and returns the status code and the body.
 async fn request(port: u16, method: &str, path: &str, host: &str, token: Option<&str>, body: &str) -> (u16, String) {
     let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
@@ -84,6 +97,10 @@ async fn every_api_route_needs_the_token() {
         ("POST", "/api/stop"),
         ("POST", "/api/link"),
         ("POST", "/api/wake"),
+        ("GET", "/api/psn-status"),
+        ("GET", "/api/psn-signin-url"),
+        ("POST", "/api/psn-signin"),
+        ("POST", "/api/psn-signout"),
     ];
     for (method, path) in routes {
         for token in [None, Some(wrong.as_str()), Some(short), Some("")] {
@@ -259,4 +276,95 @@ async fn wake_only_goes_where_the_console_answers_as_itself() {
     assert!(body.contains("home network"), "the credential is never sent to the internet: {body}");
     let (code, _) = request(s.port, "POST", "/api/wake", &host, t, r#"{"host":"127.0.0.1","pin":"1"}"#).await;
     assert_eq!(code, 422, "unknown fields are refused");
+}
+
+async fn get(s: &Server, path: &str) -> (u16, String) {
+    request(s.port, "GET", path, &format!("127.0.0.1:{}", s.port), Some(&s.token), "").await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn without_the_app_secret_psn_sign_in_says_it_is_off() {
+    let s = server().await;
+    assert_eq!(get(&s, "/api/psn-status").await, (200, r#"{"available":false,"signed_in":false}"#.into()));
+    assert_eq!(get(&s, "/api/psn-signin-url").await.0, 503);
+    let redirect = r#"{"redirect":"https://remoteplay.dl.playstation.net/remoteplay/redirect?code=abc"}"#;
+    assert_eq!(post(&s, "/api/psn-signin", redirect).await.0, 503);
+    assert_eq!(post(&s, "/api/psn-signout", "").await.0, 503, "it cannot claim to have forgotten anything");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sign_in_routes_answer_only_their_own_host() {
+    let s = server_psn().await;
+    for (method, path) in [
+        ("GET", "/api/psn-status"),
+        ("GET", "/api/psn-signin-url"),
+        ("POST", "/api/psn-signin"),
+        ("POST", "/api/psn-signout"),
+    ] {
+        let (code, _) = request(s.port, method, path, "evil.example", Some(&s.token), "{}").await;
+        assert_eq!(code, 421, "{method} {path}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_saved_sign_in_that_does_not_open_can_still_be_forgotten() {
+    let s = server_psn().await;
+    std::fs::write(s.dir.0.join(psr_psn::secret::REFRESH_TOKEN_FILE), b"not a sealed token").unwrap();
+    std::fs::write(s.dir.0.join(format!("{}.tmp", psr_psn::secret::REFRESH_TOKEN_FILE)), b"left over").unwrap();
+    assert_eq!(get(&s, "/api/psn-status").await, (200, r#"{"available":true,"signed_in":true}"#.into()));
+    assert_eq!(post(&s, "/api/psn-signout", "").await.0, 204);
+    assert_eq!(get(&s, "/api/psn-status").await.1, r#"{"available":true,"signed_in":false}"#);
+    assert!(!s.dir.0.join(format!("{}.tmp", psr_psn::secret::REFRESH_TOKEN_FILE)).exists(), "the leftover went too");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sign_in_page_is_sonys_with_a_new_device_id_each_time() {
+    let s = server_psn().await;
+    let (code, a) = get(&s, "/api/psn-signin-url").await;
+    assert_eq!(code, 200, "{a}");
+    let url =
+        |body: &str| serde_json::from_str::<serde_json::Value>(body).unwrap()["url"].as_str().unwrap().to_string();
+    let first = url(&a);
+    assert!(first.starts_with("https://auth.api.sonyentertainmentnetwork.com/2.0/oauth/authorize?"), "{first}");
+    assert!(first.contains("&duid=0000000700410080"), "{first}");
+    let second = url(&get(&s, "/api/psn-signin-url").await.1);
+    assert_ne!(first, second, "each sign-in gets its own device ID");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_sonys_redirect_page_is_taken_and_never_echoed() {
+    let s = server_psn().await;
+    for address in [
+        "https://evil.example/remoteplay/redirect?code=SECRETCODE1",
+        "http://remoteplay.dl.playstation.net/remoteplay/redirect?code=SECRETCODE1",
+        "https://remoteplay.dl.playstation.net/elsewhere?code=SECRETCODE1",
+        "https://remoteplay.dl.playstation.net:444/remoteplay/redirect?code=SECRETCODE1",
+        "not an address SECRETCODE1",
+    ] {
+        let (code, body) = post(&s, "/api/psn-signin", &format!(r#"{{"redirect":"{address}"}}"#)).await;
+        assert_eq!(code, 400, "{address}: {body}");
+        assert!(!body.contains("SECRETCODE1") && !body.contains("evil"), "{body}");
+    }
+    let (code, body) =
+        post(&s, "/api/psn-signin", r#"{"redirect":"https://remoteplay.dl.playstation.net/remoteplay/redirect?x=1"}"#)
+            .await;
+    assert_eq!(code, 400, "no code: {body}");
+    // A body that is not the expected JSON is refused without quoting it.
+    let (code, body) = post(&s, "/api/psn-signin", r#"{"redirect":12345,"code":"SECRETCODE1"}"#).await;
+    assert_eq!(code, 422, "{body}");
+    assert!(!body.contains("SECRETCODE1") && !body.contains("12345"), "{body}");
+    assert_eq!(get(&s, "/api/psn-status").await.1, r#"{"available":true,"signed_in":false}"#, "nothing was saved");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_status_follows_the_saved_sign_in_and_sign_out_forgets_it() {
+    let s = server_psn().await;
+    assert_eq!(get(&s, "/api/psn-status").await, (200, r#"{"available":true,"signed_in":false}"#.into()));
+    psr_psn::secret::save_refresh_token(&s.dir.0, "a-made-up-refresh-token").unwrap();
+    let (code, body) = get(&s, "/api/psn-status").await;
+    assert_eq!((code, body.as_str()), (200, r#"{"available":true,"signed_in":true}"#));
+    assert!(!body.contains("made-up"), "the token is never answered");
+    assert_eq!(post(&s, "/api/psn-signout", "").await.0, 204);
+    assert_eq!(get(&s, "/api/psn-status").await.1, r#"{"available":true,"signed_in":false}"#);
+    assert_eq!(post(&s, "/api/psn-signout", "").await.0, 204, "signing out twice is fine");
 }
