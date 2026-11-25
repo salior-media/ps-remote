@@ -10,7 +10,7 @@
   body { margin: 0; padding: 16px; display: grid; gap: 12px; max-width: 1280px; }
   video { width: 100%; aspect-ratio: 16 / 9; background: #000; border-radius: 6px; touch-action: none; }
   .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-  #status { font-family: ui-monospace, monospace; font-size: 13px; opacity: 0.8; }
+  #status, #delay { font-family: ui-monospace, monospace; font-size: 13px; opacity: 0.8; }
 </style>
 </head>
 <body>
@@ -27,6 +27,7 @@
   <span>Input: a gamepad, or the arrow keys, Enter (cross) and Backspace (circle) while this page has focus. The picture is the touchpad: press and drag on it (two fingers on a touchscreen).</span>
 </div>
 <div id="status">Not playing.</div>
+<div id="delay"></div>
 <script>
 "use strict";
 // The token comes in the URL's fragment (#token=...), which the service prints at start. Browsers never send
@@ -154,8 +155,41 @@ async function playPsn() {
   await connectPeer();
 }
 
+// The browser's share of the delay, from WebRTC's own counters, averaged over the last second: the round trip
+// between this browser and the service, how long a frame waits to be played, and how long it takes to decode.
+// The console-to-service leg is not in it: chiaki-ng's way to measure that (Senkusha) is switched off there too.
+let lastVideo = null;
+// Milliseconds per frame of a running total in seconds, between two samples of the same counters.
+function perFrame(now, prev, total, count) {
+  const frames = (now[count] || 0) - (prev?.[count] || 0);
+  if (!(frames > 0) || now[total] === undefined) return null;
+  return ((now[total] - (prev?.[total] || 0)) / frames) * 1000;
+}
+function describeDelay(video, prev, rttSeconds) {
+  const ms = (v) => (v === null || v === undefined ? "?" : Math.round(v) + " ms");
+  const parts = ["Browser side: round trip " + ms(rttSeconds === null ? null : rttSeconds * 1000)];
+  if (video) {
+    parts.push("buffered " + ms(perFrame(video, prev, "jitterBufferDelay", "jitterBufferEmittedCount")));
+    parts.push("decoding " + ms(perFrame(video, prev, "totalDecodeTime", "framesDecoded")));
+    parts.push("received to shown " + ms(perFrame(video, prev, "totalProcessingDelay", "framesDecoded")));
+    parts.push((video.framesPerSecond ?? "?") + " fps shown, " + (video.framesDropped ?? 0) + " dropped, " + (video.freezeCount ?? 0) + " freezes");
+  }
+  return parts.join(", ") + ".";
+}
+async function showDelay() {
+  if (!pc || pc.connectionState !== "connected") { $("delay").textContent = ""; return; }
+  let video = null, rtt = null;
+  (await pc.getStats()).forEach((r) => {
+    if (r.type === "inbound-rtp" && r.kind === "video") video = r;
+    if (r.type === "candidate-pair" && r.nominated && r.state === "succeeded" && r.currentRoundTripTime !== undefined) rtt = r.currentRoundTripTime;
+  });
+  $("delay").textContent = describeDelay(video, lastVideo, rtt);
+  lastVideo = video;
+}
+
 async function connectPeer() {
   if (pc) pc.close();
+  lastVideo = null;
   pc = new RTCPeerConnection();
   pc.addTransceiver("video", { direction: "recvonly" });
   pc.addTransceiver("audio", { direction: "recvonly" });
@@ -184,6 +218,7 @@ if (TOKEN) {
   // One after the other: the PSN list takes the start slot for its second or two.
   listConsoles().catch((e) => { $("status").textContent = String(e); }).finally(listPsnConsoles);
   setInterval(showStatus, 1000);
+  setInterval(() => showDelay().catch(() => { $("delay").textContent = ""; }), 1000);
   requestAnimationFrame(sendInput);
 } else {
   $("status").textContent = NO_TOKEN;
