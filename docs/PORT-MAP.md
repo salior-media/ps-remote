@@ -96,8 +96,8 @@ build differs from the plan, checked against `main` on 2026-11-26.
 | plan said | built with | why |
 |---|---|---|
 | `tokio` UDP and TCP in `psr-takion` and `psr-lan` | the standard library's blocking sockets, each session on its own thread; on Windows, receives wait with `WSAPoll` (`psr-lan/src/udp.rs`) | a timed receive on Windows lost datagrams that arrived just as it expired (9 of 20 runs, 0 after the change). Only `ps-remote`'s API runs on `tokio` |
-| `httparse` | a small parser of our own, `psr-lan/src/http.rs` | the console's replies are a few fixed headers |
-| `cfb-mode` | CFB-128 written over `aes`, in `psr-crypto/src/rpcrypt.rs` | matches chiaki-ng's counter handling directly |
+| `httparse` | a port of chiaki-ng's own `lib/src/http.c`, `psr-lan/src/http.rs` | the code records no reason |
+| `cfb-mode` | CFB-128 written over `aes`, in `psr-crypto/src/rpcrypt.rs` | the code records no reason |
 | `reqwest` and `tokio-tungstenite` in `psr-psn` | `ureq` 3.5 and `tungstenite` 0.30, blocking | `psr-psn` runs on the session's thread, as `psr-lan` does |
 | `service-manager` | not used yet | `ps-remote serve` is started by hand; installing it as a service is not built |
 | `str0m` | `str0m` 0.25.0, pinned | 0.26.0 was under two weeks old |
