@@ -2,6 +2,7 @@
 //! One session on its own thread: the console's stream on one side, the browser's WebRTC peer on the other.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, UdpSocket};
+use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -97,13 +98,34 @@ pub fn start(host: IpAddr, console: &RegisteredHost) -> Result<Handle, String> {
     let media_ip = media_address(host).map_err(|e| format!("no route to the console: {e}"))?;
     let ctrl = session::start(host, console, Codec::H264).map_err(|e| e.to_string())?;
     let stream = stream::connect(host, &ctrl, &VideoProfile::p720_60(Codec::H264)).map_err(|e| e.to_string())?;
+    spawn(ctrl, stream, media_ip, None)
+}
+
+/// Starts a session from away, through PSN (`psr_psn::play`; this blocks for the holepunch, around 40 s),
+/// then runs it as [`start`] does. Sony's session is left when the session ends.
+pub fn start_psn(app_secret: &str, config_dir: &Path) -> Result<Handle, String> {
+    let playing = psr_psn::play::connect(app_secret, config_dir, &VideoProfile::p720_60(Codec::H264), |_| {})
+        .map_err(|e| e.to_string())?;
+    // The browser is on this machine: its media goes to our address on the network the holes left by.
+    let media_ip = IpAddr::V4(playing.local_ip);
+    let (ctrl, stream, leaver) = playing.into_parts();
+    spawn(ctrl, stream, media_ip, Some(leaver))
+}
+
+fn spawn(
+    ctrl: Session,
+    stream: Stream,
+    media_ip: IpAddr,
+    psn: Option<psr_psn::play::Leaver>,
+) -> Result<Handle, String> {
     let (tx, rx) = mpsc::channel();
     let status = Arc::new(Mutex::new(Status { running: true, ..Status::default() }));
     let thread_status = Arc::clone(&status);
     let thread = std::thread::Builder::new()
         .name("ps-remote session".into())
         .spawn(move || {
-            let mut s = Loop { ctrl, stream, media_ip, rx, status: thread_status, bridge: None, header: Vec::new() };
+            let mut s =
+                Loop { ctrl, stream, media_ip, rx, status: thread_status, bridge: None, header: Vec::new(), psn };
             // Whatever happens in the loop, even a panic, the console is told the stream ended and the
             // status says so; otherwise the console could hold a session the API thinks is gone.
             let ended = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.run())) {
@@ -148,6 +170,8 @@ struct Loop {
     bridge: Option<Bridge>,
     /// The codec header (SPS and PPS), sent in front of each frame.
     header: Vec<u8>,
+    /// Over PSN, what leaves Sony's session; dropped after the stream ends.
+    psn: Option<psr_psn::play::Leaver>,
 }
 
 impl Loop {
@@ -264,11 +288,15 @@ impl Loop {
     }
 
     fn finish(self, ended: String) {
-        let _ = self.stream.disconnect();
-        if let Ok(mut s) = self.status.lock() {
+        let Loop { stream, psn, status, .. } = self;
+        let _ = stream.disconnect();
+        if let Ok(mut s) = status.lock() {
             s.running = false;
             s.browser_connected = false;
             s.ended = Some(ended);
         }
+        // Sony's session is left last: the console has been told the stream ended, and the status no longer
+        // waits on Sony (the security review of 9c-3b).
+        drop(psn);
     }
 }

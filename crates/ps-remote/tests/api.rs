@@ -165,3 +165,17 @@ async fn only_one_session_start_at_a_time() {
     });
     assert_eq!((a.0, b.0), (400, 409), "the second start is refused while the first runs: {a:?} {b:?}");
 }
+
+#[tokio::test]
+async fn play_over_psn_needs_the_token_and_says_when_it_is_off() {
+    let s = server().await;
+    let host = format!("127.0.0.1:{}", s.port);
+    let (code, _) = request(s.port, "POST", "/api/play-psn", &host, None, "").await;
+    assert_eq!(code, 401);
+    let (code, _) = request(s.port, "POST", "/api/play-psn", "evil.example", Some(&s.token), "").await;
+    assert_ne!(code, 204);
+    // This service was made without Sony's app secret: the route says so, and starts nothing.
+    let (code, body) = request(s.port, "POST", "/api/play-psn", &host, Some(&s.token), "").await;
+    assert_eq!(code, 503, "{body}");
+    assert!(body.contains("PSN_RP_CLIENT_SECRET"), "{body}");
+}

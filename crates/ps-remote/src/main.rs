@@ -39,7 +39,10 @@ fn app_secret() -> Result<String, Error> {
 
 fn signin() -> Result<(), Error> {
     let secret = app_secret()?;
-    println!("1. Open this address in your browser and sign in to PSN on Sony's page:\n\n{}\n", auth::login_url(&auth::client_duid()?));
+    println!(
+        "1. Open this address in your browser and sign in to PSN on Sony's page:\n\n{}\n",
+        auth::login_url(&auth::client_duid()?)
+    );
     println!("2. When the page shows \"redirect\", copy the whole address from the address bar and paste it here:");
     let mut pasted = String::new();
     std::io::stdin().lock().read_line(&mut pasted)?;
@@ -86,7 +89,16 @@ async fn serve(port: u16) -> Result<(), Error> {
     // The link carries the token in its fragment, which a browser never sends; the test page reads it there.
     println!("ps-remote is listening. Open http://127.0.0.1:{port}/#token={token}");
     println!("(The token is also in {}, for other clients.)", token_file.display());
-    axum::serve(listener, api::router(api::Service::new(token, port, consoles_dir))).await?;
+    // Playing over PSN needs Sony's app secret; without it the rest works and that route says what is missing.
+    let psn = std::env::var(auth::SECRET_VAR)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(|app_secret| api::Psn { app_secret, config_dir: dir.clone() });
+    if psn.is_some() {
+        println!("Playing over PSN is on.");
+    }
+    axum::serve(listener, api::router(api::Service::with_psn(token, port, consoles_dir, psn))).await?;
     Ok(())
 }
 

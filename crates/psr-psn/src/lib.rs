@@ -6,6 +6,7 @@
 pub mod auth;
 pub mod devices;
 pub mod holepunch;
+pub mod play;
 pub mod punch;
 pub mod push;
 pub mod regist;

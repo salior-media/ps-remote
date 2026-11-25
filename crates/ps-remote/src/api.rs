@@ -41,6 +41,15 @@ pub struct Service {
     starting: AtomicBool,
     /// One discovery search at a time, so many requests cannot fill the blocking pool with them.
     discovery: tokio::sync::Mutex<()>,
+    /// What playing over PSN needs, when the service was started with it: Sony's Remote Play app secret
+    /// (from the environment, never stored) and the folder with the saved sign-in.
+    psn: Option<Psn>,
+}
+
+/// See [`Service::psn`]. It has no `Debug`, so neither can be printed.
+pub struct Psn {
+    pub app_secret: String,
+    pub config_dir: PathBuf,
 }
 
 impl std::fmt::Debug for Service {
@@ -57,6 +66,11 @@ impl Service {
     }
 
     pub fn new(token: String, port: u16, consoles_dir: PathBuf) -> Arc<Self> {
+        Self::with_psn(token, port, consoles_dir, None)
+    }
+
+    /// [`Service::new`], able to play over PSN too.
+    pub fn with_psn(token: String, port: u16, consoles_dir: PathBuf, psn: Option<Psn>) -> Arc<Self> {
         Arc::new(Self {
             token,
             hosts: [format!("127.0.0.1:{port}"), format!("localhost:{port}")],
@@ -64,6 +78,7 @@ impl Service {
             session: Mutex::new(None),
             starting: AtomicBool::new(false),
             discovery: tokio::sync::Mutex::new(()),
+            psn,
         })
     }
 }
@@ -79,6 +94,7 @@ pub fn router(service: Arc<Service>) -> Router {
     let api = Router::new()
         .route("/consoles", get(consoles))
         .route("/play", post(play))
+        .route("/play-psn", post(play_psn))
         .route("/offer", post(offer))
         .route("/stop", post(stop))
         .route("/status", get(status))
@@ -195,12 +211,24 @@ async fn search(s: &Service, to: Ipv4Addr) -> Vec<discovery::Host> {
         .unwrap_or_default()
 }
 
-/// Clears [`Service::starting`] however `play` returns.
-struct Starting<'a>(&'a AtomicBool);
+/// Clears [`Service::starting`] when dropped. It goes into the blocking start itself, so a client that gives
+/// up while a start runs cannot let a second one begin beside it (the security review of 9c-3b): the start
+/// cannot be cancelled, and only its end frees the slot.
+struct Starting(Arc<Service>);
 
-impl Drop for Starting<'_> {
+impl Starting {
+    /// Takes the slot, or `None` when a start is already under way.
+    fn take(s: &Arc<Service>) -> Option<Self> {
+        s.starting
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Starting(Arc::clone(s)))
+    }
+}
+
+impl Drop for Starting {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        self.0.starting.store(false, Ordering::Release);
     }
 }
 
@@ -231,10 +259,9 @@ async fn play(State(s): State<Arc<Service>>, axum::Json(req): axum::Json<PlayReq
     let IpAddr::V4(ip) = req.host else {
         return refuse(StatusCode::BAD_REQUEST, "consoles are found over IPv4; give the console's IPv4 address");
     };
-    if s.starting.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+    let Some(starting) = Starting::take(&s) else {
         return refuse(StatusCode::CONFLICT, "a session is already starting");
-    }
-    let _starting = Starting(&s.starting);
+    };
     if s.session().as_ref().is_some_and(Handle::is_running) {
         return refuse(StatusCode::CONFLICT, "a session is already running");
     }
@@ -249,7 +276,45 @@ async fn play(State(s): State<Arc<Service>>, axum::Json(req): axum::Json<PlayReq
         return refuse(StatusCode::BAD_REQUEST, "that address did not answer as the linked console");
     }
     // The handshakes block for a second or two: off the async runtime.
-    let started = tokio::task::spawn_blocking(move || runner::start(req.host, &console)).await;
+    let started = tokio::task::spawn_blocking(move || {
+        let _starting = starting;
+        runner::start(req.host, &console)
+    })
+    .await;
+    match started {
+        Ok(Ok(handle)) => {
+            let old = s.session().replace(handle);
+            if let Some(old) = old {
+                tokio::task::spawn_blocking(move || old.stop());
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(Err(e)) => refuse_owned(StatusCode::BAD_GATEWAY, format!("the session did not start: {e}")),
+        Err(_) => refuse(StatusCode::INTERNAL_SERVER_ERROR, "the session start failed"),
+    }
+}
+
+/// Plays the account's console from away, through PSN (`docs/PSN.md`). No body: the console is the
+/// account's first with Remote Play on. Takes around 40 s.
+async fn play_psn(State(s): State<Arc<Service>>) -> Response {
+    let Some(psn) = s.psn.as_ref() else {
+        return refuse(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "playing over PSN needs PSN_RP_CLIENT_SECRET set when the service starts",
+        );
+    };
+    let Some(starting) = Starting::take(&s) else {
+        return refuse(StatusCode::CONFLICT, "a session is already starting");
+    };
+    if s.session().as_ref().is_some_and(Handle::is_running) {
+        return refuse(StatusCode::CONFLICT, "a session is already running");
+    }
+    let (secret, dir) = (psn.app_secret.clone(), psn.config_dir.clone());
+    let started = tokio::task::spawn_blocking(move || {
+        let _starting = starting;
+        runner::start_psn(&secret, &dir)
+    })
+    .await;
     match started {
         Ok(Ok(handle)) => {
             let old = s.session().replace(handle);

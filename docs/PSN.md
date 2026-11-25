@@ -329,6 +329,37 @@ its home screen, so the video was small (174 KiB). Nothing was decoded or shown:
 
 **Not verified yet:** any of it from another network; the data hole's use (the stream over it is 9c-3).
 
+**9c-3b, play over PSN from the app.** `crates/psr-psn/src/play.rs` `connect` runs the whole of step 9 in one
+call, from the saved sign-in to the stream, and keeps Sony's push websocket read and Sony's session joined, on a
+thread of its own, for as long as the stream plays; the session is left when it ends, or at once if the start
+fails. The service (`ps-remote serve`) offers it as `POST /api/play-psn` when `PSN_RP_CLIENT_SECRET` is set
+when it starts, and the test page has a **Play over PSN** button; the session then runs in the same loop as a
+home session (`runner.rs`), the browser's media going to our address on the network the holes left by.
+
+**9c-3b against the household's PS5 (2026-11-25), on the LAN, through the service's API:** `play-psn` answered
+204 after 31 s; the status then counted 168, 350 and 531 video frames at 3 s intervals (about 60 a second) and
+audio at about 100 a second, none lost; `stop` ended it. Not checked there: the browser's picture and sound
+(the test page needs a browser, which the owner drives), and that Sony's session was left at the end (nothing
+shows it from this side).
+
+**What the security review of 9c-3b changed** (13 findings, none critical or high, reasoned from the code):
+- **Sony's session is left even after a long stream** (MEDIUM): a leave refused with the start's access token
+  is tried again with a fresh one, since a stream can outlast it.
+- **A client that gives up during the 30 to 40 s start no longer lets a second start begin beside it**
+  (MEDIUM): the "starting" slot is held by the start itself, for both play routes, not by the request.
+- **A renewed sign-in that cannot be saved is reported, not fatal** (MEDIUM): the start goes on with what Sony
+  handed back.
+- The session is left however the keeper thread ends, a panic included, or if it cannot be started; a panic in
+  the data punch can no longer leave the start waiting for ever; the status says the session ended before Sony
+  is waited on.
+- Not changed, and why: killing the server leaves no time to leave Sony's session or end the console's (both
+  time out); a stop during a start does not cancel it (the start cannot be interrupted midway); the app secret
+  stays in the service's environment (removing it is unsafe once the runtime's threads run); error text, which
+  holds no secret, goes to the token holder; repeated starts are not slowed; a stream that fails to open after
+  ctrl is up does not tell the console (it times out).
+- After the changes, through the API again: 204 after 30 s, about 60 video frames a second, none lost, and no
+  failure to leave reported.
+
 ## What 9a does not do yet
 
 9a doesn't wake a console over PSN, run the holepunch session, or carry any media. 9b-1 adds the session's control
