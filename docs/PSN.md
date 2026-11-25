@@ -292,6 +292,13 @@ steps of chiaki-ng's 200 ms resend wake-up, rather than by a thread.
    candidate check and the answers after it, RUDP's two loops, and at home discovery, the registration search
    and the stream. Both tests stay on the boundary as its regression test. Elsewhere than Windows the read
    timeout is used as before. The whole path ran live again after the change, to the data hole.
+5. **Its security review** (no critical or high findings; reasoned, not run) changed three things. A readiness
+   with nothing behind it now waits again for the rest of the time, instead of reading as the wait over, which
+   would have ended discovery and the registration search early; such a wake pauses 1 ms, so it cannot spin; and
+   a datagram received is kept even if blocking mode cannot be put back. A test checks that a send to a closed
+   port still surfaces as Windows' connection reset through the wait, which the registration search reads as
+   the console not listening. Not tested: the spurious readiness itself, which needs a seam to fake; and the
+   cost to the home stream, now four system calls a packet instead of two, not measured against a real stream.
 
 **Not verified yet:** any of it from another network; the data hole's use (the stream over it is 9c-3).
 

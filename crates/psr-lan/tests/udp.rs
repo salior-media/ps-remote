@@ -71,3 +71,20 @@ fn many_in_a_row_all_arrive() {
     println!("{seen} of {N} in {:?}", begun.elapsed());
     assert_eq!(seen, N);
 }
+
+/// The registration search reads Windows' "connection reset" (an ICMP port-unreachable for our send) as the
+/// console not listening, so the wait must still report it.
+#[test]
+fn a_send_to_a_closed_port_still_reports_its_reset_through_the_wait() {
+    let gone = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let closed = gone.local_addr().unwrap();
+    drop(gone);
+    let s = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    s.send_to(b"anyone?", closed).unwrap();
+    let r = udp::recv_from_within(&s, &mut [0u8; 16], Duration::from_secs(1));
+    if cfg!(windows) {
+        assert_eq!(r.map(|_| ()).unwrap_err().kind(), std::io::ErrorKind::ConnectionReset);
+    } else {
+        assert!(matches!(r, Ok(None)), "{r:?}");
+    }
+}

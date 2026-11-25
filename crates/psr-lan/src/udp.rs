@@ -4,6 +4,9 @@
 //! `UdpSocket::set_read_timeout` sets) lost the answer it was waiting for in the punch tests, 9 runs in 20,
 //! when the answer arrived as the wait ran out, and Winsock's documentation does not say what state such a
 //! receive leaves the socket in (`docs/PSN.md`, step 9c-2). Elsewhere the read timeout is used as before.
+//!
+//! The socket is non-blocking for the moment of each receive, so it must not be shared with another thread
+//! that relies on blocking reads meanwhile; none in ps-remote is.
 
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
@@ -32,17 +35,38 @@ fn received<T>(r: io::Result<Option<T>>) -> io::Result<Option<T>> {
 }
 
 #[cfg(windows)]
-fn within<T>(sock: &UdpSocket, timeout: Duration, recv: impl FnOnce() -> io::Result<T>) -> io::Result<Option<T>> {
-    if !readable(sock, timeout)? {
-        return Ok(None);
+fn within<T>(sock: &UdpSocket, timeout: Duration, mut recv: impl FnMut() -> io::Result<T>) -> io::Result<Option<T>> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if !readable(sock, deadline.saturating_duration_since(std::time::Instant::now()))? {
+            return Ok(None);
+        }
+        // Something is there, or an error is. Received without blocking, so a readiness that went away cannot
+        // turn into a wait with no end.
+        sock.set_nonblocking(true)?;
+        let r = recv();
+        let restored = sock.set_nonblocking(false);
+        match r {
+            // Ready, then nothing: wait again for what is left, rather than report the wait over (the security
+            // review: discovery and the registration search would stop early). A pause, so a readiness that
+            // keeps coming back with nothing cannot spin.
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                restored?;
+                if std::time::Instant::now() >= deadline {
+                    return Ok(None);
+                }
+                std::thread::sleep(SPURIOUS_PAUSE);
+            }
+            // What was received is kept even if blocking mode could not be put back; the next wait sets it again.
+            Ok(v) => return Ok(Some(v)),
+            Err(e) => return Err(e),
+        }
     }
-    // Something is there, or an error is. Received without blocking, so a readiness that went away cannot
-    // turn into a wait with no end.
-    sock.set_nonblocking(true)?;
-    let r = recv();
-    sock.set_nonblocking(false)?;
-    r.map(Some)
 }
+
+/// How long to wait after a readiness with nothing behind it.
+#[cfg(windows)]
+const SPURIOUS_PAUSE: Duration = Duration::from_millis(1);
 
 /// Whether the socket has something to read (or an error to report) within `timeout`.
 #[cfg(windows)]
@@ -64,7 +88,7 @@ fn readable(sock: &UdpSocket, timeout: Duration) -> io::Result<bool> {
 }
 
 #[cfg(not(windows))]
-fn within<T>(sock: &UdpSocket, timeout: Duration, recv: impl FnOnce() -> io::Result<T>) -> io::Result<Option<T>> {
+fn within<T>(sock: &UdpSocket, timeout: Duration, mut recv: impl FnMut() -> io::Result<T>) -> io::Result<Option<T>> {
     sock.set_read_timeout(Some(timeout.max(Duration::from_millis(1))))?;
     recv().map(Some)
 }
