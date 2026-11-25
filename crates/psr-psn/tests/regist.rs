@@ -143,3 +143,31 @@ fn no_finish_is_carried_on_from_and_a_refusal_is_reported() {
     t.join().unwrap();
     assert!(matches!(refused, Err(PsnError::Lan(LanError::Refused { code: 403, .. }))), "{refused:?}");
 }
+
+#[test]
+fn a_malformed_answer_names_no_key_in_its_error() {
+    let target = Target::Ps5V1;
+    let crypt = RpCrypt::regist_psn(target, &[1; 16], 0, &[2; 16], &[3; 16], &[4; 16]).unwrap();
+    let answer = |plain: &[u8], length: Option<&str>| {
+        let body = crypt.encrypt(0, plain);
+        let len = length.map_or(body.len().to_string(), str::to_string);
+        let mut r = format!("HTTP/1.1 200 OK\r\nContent-Length: {len}\r\n\r\n").into_bytes();
+        r.extend(body);
+        r
+    };
+    let secret = "00112233445566778899aabbccddeeff";
+    for plain in [
+        format!("RP-Key: {secret}\r\n\u{0}").into_bytes().into_iter().chain([0xFF]).collect::<Vec<u8>>(),
+        [format!("RP-Key: {secret}\r\n").as_bytes(), &[0xFF, b'\r', b'\n']].concat(),
+        format!("RP-Key: {secret}\r\nno colon here {secret}\r\n").into_bytes(),
+        format!("PS5-RegistKey:\r\nRP-Key: {secret}\r\n").into_bytes(),
+    ] {
+        let e = psr_lan::regist::parse_response(target, &crypt, &answer(&plain, None)).unwrap_err();
+        for shown in [e.to_string(), format!("{e:?}")] {
+            assert!(!shown.contains(secret), "{shown}");
+        }
+    }
+    // A length that would overflow is a short answer, not a crash.
+    let e = psr_lan::regist::parse_response(target, &crypt, &answer(b"x", Some("18446744073709551615"))).unwrap_err();
+    assert!(matches!(e, LanError::Truncated), "{e:?}");
+}

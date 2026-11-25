@@ -28,29 +28,25 @@ pub fn parse_response(buf: &[u8]) -> Result<Response, LanError> {
         return Err(LanError::NotHttp);
     }
     let status = std::str::from_utf8(&rest[..line_end]).map_err(|_| LanError::NotHttp)?.trim_end_matches('\r');
-    let code = status
-        .split(' ')
-        .next()
-        .and_then(|c| c.parse::<u16>().ok())
-        .filter(|&c| c != 0)
-        .ok_or(LanError::NotHttp)?;
+    let code =
+        status.split(' ').next().and_then(|c| c.parse::<u16>().ok()).filter(|&c| c != 0).ok_or(LanError::NotHttp)?;
     Ok(Response { code, headers: parse_headers(&rest[line_end + 1..])? })
 }
 
 /// chiaki-ng `chiaki_http_header_parse`.
 pub fn parse_headers(buf: &[u8]) -> Result<Vec<(String, String)>, LanError> {
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    let text = std::str::from_utf8(&buf[..end]).map_err(|_| LanError::BadHeader(String::from_utf8_lossy(buf).into()))?;
+    let text = std::str::from_utf8(&buf[..end]).map_err(|_| LanError::BadHeader("text that is not UTF-8".into()))?;
     let mut headers = Vec::new();
     for line in text.split('\n') {
         let line = line.strip_suffix('\r').unwrap_or(line);
         if line.is_empty() {
             continue;
         }
-        let (key, value) = line.split_once(':').ok_or_else(|| LanError::BadHeader(line.into()))?;
+        let (key, value) = line.split_once(':').ok_or_else(|| LanError::BadHeader("a line with no colon".into()))?;
         let value = value.strip_prefix(' ').unwrap_or(value);
         if key.is_empty() || value.is_empty() {
-            return Err(LanError::BadHeader(line.into()));
+            return Err(LanError::BadHeader(name_only(key)));
         }
         headers.push((key.to_string(), value.to_string()));
     }
@@ -59,6 +55,14 @@ pub fn parse_headers(buf: &[u8]) -> Result<Vec<(String, String)>, LanError> {
         headers.pop();
     }
     Ok(headers)
+}
+
+/// What a malformed header may say about itself: its name, cut short and printable, never its value or the
+/// text around it. A registration body holds the console's keys, and an error message can reach a log.
+pub fn name_only(key: &str) -> String {
+    const NAME_MAX: usize = 40;
+    let name: String = key.chars().filter(|c| c.is_ascii_graphic()).take(NAME_MAX).collect();
+    if name.is_empty() { "a header with no name".into() } else { format!("the {name} header") }
 }
 
 /// Where a response's header ends (after `\r\n\r\n`), if it has arrived yet.

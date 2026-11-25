@@ -262,7 +262,7 @@ pub fn parse_response(target: Target, crypt: &RpCrypt, response: &[u8]) -> Resul
     }
     let content_len: usize =
         head.header("Content-Length").and_then(|v| v.trim().parse().ok()).filter(|&n| n > 0).ok_or(LanError::MissingField("Content-Length"))?;
-    let body = response.get(header_len..header_len + content_len).ok_or(LanError::Truncated)?;
+    let body = header_len.checked_add(content_len).and_then(|end| response.get(header_len..end)).ok_or(LanError::Truncated)?;
     parse_response_payload(target, &crypt.decrypt(0, body))
 }
 

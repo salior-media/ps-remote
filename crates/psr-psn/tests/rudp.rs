@@ -201,3 +201,47 @@ fn a_stream_of_wrong_messages_does_not_hold_a_try_open() {
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     flood.join().unwrap();
 }
+
+#[test]
+fn a_header_without_the_tag_or_the_constant_ends_the_chain() {
+    let good = rudp::serialize(&[(rudp::INIT_RESPONSE, &[0; 8])]);
+    let mut untagged = good.clone();
+    untagged[0] = 0x00;
+    let mut wrong_constant = good.clone();
+    wrong_constant[5] ^= 1;
+    for bad in [&untagged, &wrong_constant] {
+        assert!(rudp::parse(bad).is_empty());
+        // Nor is anything after it read: its length cannot be trusted to find the next.
+        assert!(rudp::parse(&[&bad[..], &good[..]].concat()).is_empty());
+    }
+    // A well-formed message followed by a malformed one keeps the first.
+    assert_eq!(rudp::parse(&[&good[..], &untagged[..]].concat()).len(), 1);
+}
+
+#[test]
+fn a_request_too_long_for_one_message_is_refused_unsent() {
+    let (client, console) = pair();
+    console.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+    let mut r = Rudp::with(client, COUNTER, HEADER);
+    let mut remote = 0;
+    let request = vec![b'x'; rudp::MAX_DATA - 1];
+    assert!(matches!(r.http(&mut remote, &request), Err(PsnError::Rudp(_))));
+    assert!(console.recv_from(&mut [0u8; 16]).is_err(), "nothing was sent");
+    // The longest that fits is framed with its true length.
+    let longest = rudp::session_message(COUNTER, 0, &request[..rudp::MAX_DATA - 2]);
+    assert_eq!(rudp::parse(&longest)[1].data.len(), rudp::MAX_DATA);
+}
+
+#[test]
+#[should_panic(expected = "at most")]
+fn serialize_will_not_cut_a_length_short() {
+    rudp::serialize(&[(rudp::CTRL_MESSAGE, &vec![0; rudp::MAX_DATA + 1])]);
+}
+
+#[test]
+fn a_messages_debug_shows_no_data() {
+    let m = Message { kind: rudp::CTRL_MESSAGE, data: vec![0xAB; 3] };
+    let d = format!("{m:?}");
+    assert!(d.contains("0x0230") && d.contains("len: 3"), "{d}");
+    assert!(!d.contains("171") && !d.to_lowercase().contains("ab, "), "{d}");
+}

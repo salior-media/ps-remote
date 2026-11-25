@@ -185,8 +185,57 @@ before the real cause was found; whether Sony also accepts `+` was not tested.
    and wrote the upgrade request by hand with chiaki-ng's spelling. It was still 403. The hand-written handshake
    stays, because it leaves nothing about the request to a library, but header case was not the cause.
 
+## 9c in detail
+
+> Owner, 2026-11-25: *"Merge, start 9c"*.
+
+After the control hole, chiaki-ng's `session.c` runs everything over **RUDP** on it, in this order, before it
+punches the data hole: registration, the session request, then ctrl. 9c follows that order in three steps:
+
+| step | ports | done when |
+|---|---|---|
+| **9c-1** | `rudp.c`'s framing, handshake and HTTP exchange; `regist.c`'s `holepunch_info` path | the console registers this client through the hole |
+| **9c-2** | the session request and ctrl over RUDP (`session.c`, `ctrl.c`), `rudpsendbuffer.c` | ctrl runs through the hole and the console offers the data hole |
+| **9c-3** | the data hole, and Takion and the stream over it | the PS5 plays in the test page through the holes |
+
+**9c-1, RUDP and registration.** `crates/psr-psn/src/rudp.rs` frames messages as chiaki-ng does: an 8-byte header
+(`0xC000 | length`, the constant `0x244F244F`, the type), the data, and possibly a second message chained after it.
+The handshake is INIT, answered with a cookie, then COOKIE carrying it back. An HTTP request goes in a
+SESSION_MESSAGE with the request chained in a CTRL_MESSAGE; the answer is a CTRL_MESSAGE, then ACK and FINISH.
+`crates/psr-psn/src/regist.rs` sends the home network's registration request through it, with two changes from
+chiaki-ng's `holepunch_info` path: the cipher is made from the session's `customData1`, `data1` and `data2`
+instead of a PIN, and `HOST` is this client's local address.
+
+Differences from chiaki-ng, each in the module's header:
+- **A wrong message does not cost a try.** chiaki-ng resends as soon as one datagram is not the answer; here each
+  of the 3 tries listens its whole second, passing over the rest, so a late holepunch request cannot use them up.
+- **A datagram too short to be RUDP is passed over**, where chiaki-ng ends the exchange.
+- **An answer too short for what is read from it is passed over** like any other wrong message, not taken and
+  then checked.
+
+**9c-1 against the household's PS5 (2026-11-25), on the LAN:** the hole was punched 33.3 s after the start, and
+the console registered this client through it 88 ms later and sent FINISH. Its registration key and RP key match
+the ones saved when it was registered at home with a PIN (the example compares them and prints only whether they
+match). That is also the first check that our side of the session's `data1` and `data2` is what the console
+uses: a wrong value would have derived another cipher, and the console would have refused.
+
+**What the security review of 9c-1 changed** (10 findings, none critical or high, all reasoned from the code):
+- **No header value reaches an error message.** A malformed header used to be quoted whole, and for a registration
+  answer that text is the decrypted body with both keys in it. Errors now name the header only (`name_only` in
+  `psr-lan`'s `http.rs`), at home and over PSN alike.
+- **A `Content-Length` that would overflow** is a short answer, not a crash.
+- **A message's header must be well formed**: the length word's `0xC` tag and the constant, or the rest of the
+  datagram is passed over. chiaki-ng matches answers on one byte. Every message the PS5 sent passed the check in
+  a second live run (registered 77 ms after the hole, keys matching).
+- **A request too long for one message is refused** instead of framed with a cut length; a connection reset is
+  waited out 10 ms at a time instead of spinning; `Message`'s `Debug` shows the type and length, not the bytes.
+- Left as chiaki-ng has them: a failed send counts as a try with no answer, and `HOST` carries our LAN address (the
+  console is the only one who sees it).
+
+**Not verified yet:** any of it from another network.
+
 ## What 9a does not do yet
 
 9a doesn't wake a console over PSN, run the holepunch session, or carry any media. 9b-1 adds the session's control
-plane, 9b-2a wakes the console and reads its offer, and 9b-2b punches the control hole. RUDP over that hole,
-registration, the data hole and the stream are 9c.
+plane, 9b-2a wakes the console and reads its offer, and 9b-2b punches the control hole. 9c-1 runs RUDP over that
+hole and registers through it; the session request, ctrl, the data hole and the stream are 9c-2 and 9c-3.

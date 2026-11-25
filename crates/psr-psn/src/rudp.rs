@@ -21,6 +21,13 @@
 //! - **A datagram too short to be RUDP is passed over**, where chiaki-ng ends the exchange.
 //! - **The answer's minimum length is checked before it is taken**, not after, so a short one is passed over
 //!   like any other wrong message.
+//! - **A message's header must be well formed** (the security review's finding): its length word must start
+//!   with `0xC` and the constant must follow, or it and the rest of its datagram are passed over. chiaki-ng
+//!   reads any eight bytes as a header, so a late holepunch or STUN datagram whose seventh byte happened to be
+//!   right would count as the answer. Every message the console sent in the live runs had both.
+//! - **A request too long for one message is refused** rather than sent with its 12-bit length cut short.
+//! - **A connection reset is waited out**, 10 ms at a time, where the loop would otherwise spin until the try
+//!   ends (Windows reports an ICMP port-unreachable on the next receive).
 
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
@@ -35,6 +42,12 @@ pub const EXPECT_TIMEOUT: Duration = Duration::from_secs(1);
 pub const TRIES: usize = 3;
 /// chiaki-ng's receive buffer.
 pub const RECV_LEN: usize = 1500;
+/// The 12-bit length covers the header and the data.
+pub const MAX_DATA: usize = 0x0FFF - HEADER_LEN;
+/// The top four bits of every header's length word.
+const LEN_TAG: u16 = 0xC000;
+/// How long to wait after a connection reset before receiving again.
+const RESET_PAUSE: Duration = Duration::from_millis(10);
 
 pub const INIT_REQUEST: u16 = 0x8030;
 pub const INIT_RESPONSE: u16 = 0xD000;
@@ -53,11 +66,21 @@ const AFTER_COUNTER: [u8; 6] = [0x0B, 0x01, 0x01, 0x00, 0x01, 0x00];
 const AFTER_HEADER: [u8; 2] = [0x05, 0x82];
 const AFTER_ACK_COUNTERS: [u8; 2] = [0x00, 0x92];
 
-/// One message of a datagram.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One message of a datagram. Its `Debug` shows the type and the data's length, not the data, which may be
+/// a registration's ciphertext or, later, ctrl's.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Message {
     pub kind: u16,
     pub data: Vec<u8>,
+}
+
+impl std::fmt::Debug for Message {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Message")
+            .field("kind", &format_args!("{:#06x}", self.kind))
+            .field("len", &self.data.len())
+            .finish()
+    }
 }
 
 impl Message {
@@ -74,12 +97,16 @@ impl Message {
 
 /// chiaki-ng `rudp_message_serialize`: each message's header and data, in order (the second chained after
 /// the first). The header's length covers its own message only.
+///
+/// # Panics
+/// If a message's data is longer than [`MAX_DATA`]: its length would not fit. [`Rudp::http`] refuses such a
+/// request before it gets here.
 pub fn serialize(messages: &[(u16, &[u8])]) -> Vec<u8> {
     let mut out = Vec::new();
     for (kind, data) in messages {
-        // The length is 12 bits; nothing built here comes near 4 KiB.
-        let len = u16::try_from(HEADER_LEN + data.len()).unwrap_or(0x0FFF) & 0x0FFF;
-        out.extend((0xC000 | len).to_be_bytes());
+        assert!(data.len() <= MAX_DATA, "an RUDP message's data is at most {MAX_DATA} bytes");
+        let len = u16::try_from(HEADER_LEN + data.len()).unwrap_or(0x0FFF);
+        out.extend((LEN_TAG | len).to_be_bytes());
         out.extend(CONSTANT.to_be_bytes());
         out.extend(kind.to_be_bytes());
         out.extend(*data);
@@ -88,12 +115,17 @@ pub fn serialize(messages: &[(u16, &[u8])]) -> Vec<u8> {
 }
 
 /// chiaki-ng `chiaki_rudp_message_parse`: the chain of messages in a datagram. A length that runs past the
-/// datagram is cut to what is there; bytes after the last message too few for a header are ignored.
+/// datagram is cut to what is there; bytes after the last message too few for a header are ignored. A header
+/// without the `0xC` tag and the constant ends the chain there (see the module notes).
 pub fn parse(datagram: &[u8]) -> Vec<Message> {
     let mut out = Vec::new();
     let mut rest = datagram;
     while rest.len() >= HEADER_LEN {
-        let len = usize::from(u16::from_be_bytes([rest[0], rest[1]]) & 0x0FFF);
+        let word = u16::from_be_bytes([rest[0], rest[1]]);
+        if word & 0xF000 != LEN_TAG || rest[2..6] != CONSTANT.to_be_bytes() {
+            break;
+        }
+        let len = usize::from(word & 0x0FFF);
         let kind = u16::from_be_bytes([rest[6], rest[7]]);
         let data_len = len.saturating_sub(HEADER_LEN).min(rest.len() - HEADER_LEN);
         out.push(Message { kind, data: rest[HEADER_LEN..HEADER_LEN + data_len].to_vec() });
@@ -255,6 +287,10 @@ impl Rudp {
                 self.sock.set_read_timeout(Some((deadline - now).max(Duration::from_millis(1)))).map_err(io)?;
                 let n = match self.sock.recv(&mut buf) {
                     Ok(n) => n,
+                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                        std::thread::sleep(RESET_PAUSE);
+                        continue;
+                    }
                     Err(e) if stun::is_transient(&e) => continue,
                     Err(e) => return Err(io(e)),
                 };
@@ -277,6 +313,10 @@ impl Rudp {
     /// Step 3's request and response (chiaki-ng `chiaki_send_recv_http_header_psn`): the whole response, which
     /// must hold a complete HTTP header. `remote_counter` becomes the console's next.
     pub fn http(&mut self, remote_counter: &mut u16, request: &[u8]) -> Result<Vec<u8>, PsnError> {
+        // The chained CTRL_MESSAGE carries our counter, then the request.
+        if request.len() + 2 > MAX_DATA {
+            return Err(PsnError::Rudp("the request is too long for one RUDP message"));
+        }
         let send = Send::Session { remote_counter: *remote_counter, payload: request };
         let m = self.send_recv(send, Expect::Ctrl, 2)?;
         *remote_counter = m.remote_counter().ok_or(PsnError::MissingField("RUDP counter"))?;

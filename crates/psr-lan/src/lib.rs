@@ -19,7 +19,8 @@ use crate::session::reason_text;
 pub enum LanError {
     #[error("not an HTTP/1.1 response")]
     NotHttp,
-    #[error("malformed header line: {0:?}")]
+    /// Names what was malformed, never the value: see [`http::name_only`].
+    #[error("malformed header: {0}")]
     BadHeader(String),
     #[error("network: {0}")]
     Io(std::io::Error),
