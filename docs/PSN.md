@@ -253,6 +253,28 @@ steps of chiaki-ng's 200 ms resend wake-up, rather than by a thread.
    fallback ID, and so does the port (at home the PS5 sends one, in a form chiaki-ng's rules refuse, so the
    fallback is used there too). The 10 s is the whole of the gap between registration and ctrl being up.
 
+**What the security review of 9c-2 changed** (9 findings, none critical or high, all reasoned from the code):
+- **A datagram whose counter is not new is acknowledged but not read again** (MEDIUM). Read twice, as when the
+  console resends because our ACK was late or someone replays one, a frame advances the ctrl cipher's counter
+  and every message after it decrypts to garbage. The live run after the change was as before: 4 heartbeat
+  requests answered, 2 other messages, ctrl still up.
+- **What a spoofed datagram can do is narrowed** (MEDIUM). An empty session ID, which uses no cipher counter, no
+  longer ends the wait for the console's; heartbeat requests closer than 1 s to our last reply are not answered,
+  so a flood cannot fill the 16-slot send buffer; a frame over ctrl's 512 bytes is passed over instead of ending
+  ctrl. The home network's ctrl gets the first two too, since it shares the code.
+- **A console that stops acknowledging is reported**: after 25 resends reading ctrl fails, where chiaki-ng drops
+  the message and carries on.
+- Deliberate breaks: 23 on 9c-2 (19 caught at first; the size, the counter a message waits under and the bytes
+  after ctrl's answer got tests; one miss was a stale build), and 10 on these fixes, all caught after one more
+  test (the give-up report).
+- A full send buffer is refused before a counter is taken or anything sent; a failed ACK no longer ends ctrl (the
+  console's resend brings another chance); `Incoming`'s `Debug` shows the frames' length, not their bytes.
+- **Left as they are, because RUDP and ctrl carry no authentication** (as in chiaki-ng): anyone who can put
+  datagrams on the hole with the console's address can still send FINISH, acknowledge our messages so they are
+  not resent, answer the session request first with a nonce of their choosing, or ask for the login PIN. Over
+  PSN the hole's address is the only thing in the way; at home TCP's sequence numbers made that harder. The
+  session request also carries the registration key in the clear, as at home.
+
 **Found while verifying 9c-2: on Windows, an answer arriving as a receive times out can be lost.** The punch test
 `only_a_request_makes_a_derived_candidate` failed 6 runs in 20. Its stand-in console answered 1.5 s after the
 first request, exactly when one of our 500 ms receive timeouts runs out. Answering 250 ms off that boundary, it

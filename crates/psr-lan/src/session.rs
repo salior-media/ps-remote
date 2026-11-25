@@ -22,6 +22,9 @@ pub const SESSION_PORT: u16 = 9295;
 const EXPECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// chiaki-ng `SESSION_EXPECT_CTRL_START_MS`: how long the console has to send its session ID.
 const CTRL_START_TIMEOUT: Duration = Duration::from_secs(10);
+/// A heartbeat request this soon after the last reply is not answered again, so a flood of them cannot fill
+/// RUDP's send buffer (the security review of step 9c-2). The console asks every few seconds.
+const HEARTBEAT_MIN_GAP: Duration = Duration::from_secs(1);
 /// chiaki-ng: "PS4 doesn't always react right away, sleep a bit".
 const BEFORE_CTRL_DELAY: Duration = Duration::from_millis(10);
 /// chiaki-ng reads both HTTP replies into a 512-byte buffer.
@@ -120,7 +123,9 @@ pub fn parse_session_response(head: &[u8]) -> Result<[u8; 16], LanError> {
         let raw = base64::engine::general_purpose::STANDARD.decode(nonce.trim()).map_err(|_| LanError::BadNonce)?;
         return raw.try_into().map_err(|_| LanError::BadNonce);
     }
-    let reason = response.header("RP-Application-Reason").and_then(|r| u32::from_str_radix(r.trim().trim_start_matches("0x"), 16).ok());
+    let reason = response
+        .header("RP-Application-Reason")
+        .and_then(|r| u32::from_str_radix(r.trim().trim_start_matches("0x"), 16).ok());
     // chiaki-ng matches this one header without regard to case.
     let rp_version =
         response.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("RP-Version")).map(|(_, v)| v.clone());
@@ -174,7 +179,8 @@ fn read_head(stream: &mut TcpStream, what: &'static str) -> Result<(Vec<u8>, Vec
         if buf.len() >= HEAD_BUF_SIZE {
             return Err(LanError::Truncated);
         }
-        let left = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()).ok_or(LanError::Timeout(what))?;
+        let left =
+            deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()).ok_or(LanError::Timeout(what))?;
         stream.set_read_timeout(Some(left)).map_err(io)?;
         match stream.read(&mut chunk[..HEAD_BUF_SIZE - buf.len()]) {
             Ok(0) => return Err(LanError::CtrlClosed),
@@ -406,9 +412,8 @@ impl Session {
             None => {
                 let mut random = [0u8; 48];
                 getrandom::fill(&mut random).map_err(|e| LanError::Random(e.to_string()))?;
-                let seconds = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_secs());
+                let seconds =
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
                 self.session_id = fallback_session_id(seconds, &random);
                 self.session_id_was_fallback = true;
             }
@@ -452,8 +457,15 @@ impl Session {
     fn drain(&mut self) -> Result<Vec<CtrlEvent>, LanError> {
         let mut events = Vec::new();
         while let Some((ty, payload)) = self.framer.next_frame() {
+            // A session ID is never empty; an empty one uses no counter, so anyone could send it to cut short
+            // the wait for the console's. Passed over (the security review of step 9c-2).
+            if ty == MessageType::SessionId.code() && payload.is_empty() {
+                continue;
+            }
             let event = ctrl::event(ty, &self.cipher.open(&payload));
-            if event == CtrlEvent::HeartbeatRequested {
+            if event == CtrlEvent::HeartbeatRequested
+                && self.last_heartbeat.is_none_or(|last| last.elapsed() >= HEARTBEAT_MIN_GAP)
+            {
                 self.send_heartbeat()?;
             }
             events.push(event);
