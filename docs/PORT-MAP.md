@@ -85,3 +85,35 @@ Steps 1–3 need no console and can start now. Steps 4–9 need the household PS
   Rust and no OpenSSL, the exception doesn't matter in practice.
 - Ported test vectors keep their origin in a comment.
 - The games app never links these crates. It talks to the `ps-remote` service through its API.
+
+## 6. What the build changed (2026-11-26)
+
+Sections 1–5 are the plan as written on 2026-11-24, kept as they were. Steps 1–9 are now built. This is where the
+build differs from the plan, checked against `main` on 2026-11-26.
+
+**Building blocks**
+
+| plan said | built with | why |
+|---|---|---|
+| `tokio` UDP and TCP in `psr-takion` and `psr-lan` | the standard library's blocking sockets, each session on its own thread; on Windows, receives wait with `WSAPoll` (`psr-lan/src/udp.rs`) | a timed receive on Windows lost datagrams that arrived just as it expired (9 of 20 runs, 0 after the change). Only `ps-remote`'s API runs on `tokio` |
+| `httparse` | a small parser of our own, `psr-lan/src/http.rs` | the console's replies are a few fixed headers |
+| `cfb-mode` | CFB-128 written over `aes`, in `psr-crypto/src/rpcrypt.rs` | matches chiaki-ng's counter handling directly |
+| `reqwest` and `tokio-tungstenite` in `psr-psn` | `ureq` 3.5 and `tungstenite` 0.30, blocking | `psr-psn` runs on the session's thread, as `psr-lan` does |
+| `service-manager` | not used yet | `ps-remote serve` is started by hand; installing it as a service is not built |
+| `str0m` | `str0m` 0.25.0, pinned | 0.26.0 was under two weeks old |
+
+**Steps**
+
+| # | state |
+|---|---|
+| 1–7 | built, with chiaki-ng's test vectors passing |
+| 8 | split: **8a**, the service and its own test page, is built and was seen playing the PS5 at home; **8b**, the games app's *PlayStation* tab, is not built (`docs/SERVICE.md`) |
+| 9 | built; run live on the home network only, at about 60 frames a second with none lost. From another network it has not been tried (`docs/PSN.md`) |
+
+**Section 3**
+
+- 3.1: both points are proved. The session asks for H.264, and a browser's picture-lost request becomes a request to
+  the console for a keyframe (`ps-remote/src/bridge.rs`, `runner.rs`).
+- 3.2, several controllers: not built. Input takes one controller's state, and up to two touchpad fingers.
+- `senkusha` (§2, `psr-takion`) is not ported. chiaki-ng compiles it but never runs it, since no build defines
+  `ENABLE_SENKUSHA`. The test page shows the browser's share of the delay instead.
