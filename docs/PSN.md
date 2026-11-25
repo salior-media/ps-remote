@@ -289,6 +289,19 @@ with one resolution offered, and ran 15 s: 890 video frames (59.3 a second, of t
 frames, no frame lost and no datagram dropped, with ctrl polled every 100 ms as the app does. The console was on
 its home screen, so the video was small (174 KiB). Nothing was decoded or shown: that is the app's part, 9c-3b.
 
+**What the security review of 9c-3a changed** (7 findings, none critical or high, reasoned from the code):
+- The drain passes over "connection refused" as it does Windows' reset (both are an earlier send unanswered),
+  pausing 1 ms each, where a refusal used to end the stream's start on Linux and macOS and a run of resets spun.
+- The ctrl messages that come while waiting for the switch are returned to the caller, at most 64, where they
+  were dropped; and the unasked heartbeat reply goes out during that wait too.
+- **Left as chiaki-ng has it (MEDIUM, DoS only):** the console's switch is known by its type, and an empty frame
+  uses no cipher counter, so someone who can send to the control hole as the console can answer the switch
+  first. The stream's start then fails when the console does not take it up (about 15 s); nothing is learned or
+  taken over, as Takion's own handshake and keys are unchanged. A datagram arriving on the data hole after the
+  drain goes quiet can likewise end the stream's handshake, as it could at home.
+- Deliberate breaks: 8 on 9c-3a, 6 caught; the drain's two timings got a test pinning chiaki-ng's values; the
+  drain inside `open_stream` is checked only by the live run. The new bound was broken and caught.
+
 **Found while verifying 9c-2, and fixed: on Windows an answer that arrives as a receive times out can be lost.**
 1. The punch test `only_a_request_makes_a_derived_candidate` failed 9 runs in 20. Its stand-in console answers
    1.5 s after our first request, as one of our 500 ms waits ends, and on failing runs the answer never came out

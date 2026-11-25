@@ -208,6 +208,8 @@ fn the_data_hole_is_drained_until_quiet_or_a_second() {
     let begun = Instant::now();
     assert_eq!(session::drain(&hole).unwrap(), 3);
     let took = begun.elapsed();
+    // chiaki-ng's: 200 ms with nothing, a second in all.
+    assert_eq!((session::DRAIN_QUIET, session::DRAIN_MAX), (Duration::from_millis(200), Duration::from_secs(1)));
     assert!(took >= session::DRAIN_QUIET && took < session::DRAIN_QUIET * 3, "{took:?}");
     // A trickle that never goes quiet is cut off at a second.
     let to = hole.local_addr().unwrap();

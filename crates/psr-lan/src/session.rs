@@ -25,6 +25,8 @@ const CTRL_START_TIMEOUT: Duration = Duration::from_secs(10);
 /// A heartbeat request this soon after the last reply is not answered again, so a flood of them cannot fill
 /// RUDP's send buffer (the security review of step 9c-2). The console asks every few seconds.
 const HEARTBEAT_MIN_GAP: Duration = Duration::from_secs(1);
+/// How many other ctrl messages [`Session::switch_to_stream`] keeps while it waits.
+pub const SWITCH_EVENTS_MAX: usize = 64;
 /// chiaki-ng: "PS4 doesn't always react right away, sleep a bit".
 const BEFORE_CTRL_DELAY: Duration = Duration::from_millis(10);
 /// chiaki-ng reads both HTTP replies into a 512-byte buffer.
@@ -446,16 +448,25 @@ impl Session {
         let deadline = Instant::now() + timeout;
         let mut others = Vec::new();
         loop {
+            self.heartbeat_if_due()?;
             for e in self.drain()? {
                 if e == CtrlEvent::SwitchToStreamConnection {
                     return Ok(others);
                 }
-                others.push(e);
+                // Kept for the caller up to a bound, so a flood in the wait cannot grow it without end.
+                if others.len() < SWITCH_EVENTS_MAX {
+                    others.push(e);
+                }
             }
             let Some(left) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else {
                 return Err(LanError::Timeout("switch to stream connection ack"));
             };
-            self.read_some(left)?;
+            // Woken for the next unasked heartbeat too, as `poll` is.
+            let until_heartbeat = match (self.heartbeat_every, self.last_heartbeat) {
+                (Some(every), Some(last)) => every.saturating_sub(last.elapsed()),
+                _ => left,
+            };
+            self.read_some(left.min(until_heartbeat).max(Duration::from_millis(1)))?;
         }
     }
 

@@ -502,3 +502,14 @@ fn the_switch_to_the_stream_waits_for_the_consoles_and_returns_the_rest() {
     assert!(s.switch_to_stream(std::time::Duration::from_secs(5)).unwrap().is_empty());
     assert!(begun.elapsed() < std::time::Duration::from_millis(100));
 }
+
+#[test]
+fn what_comes_while_waiting_for_the_switch_is_kept_up_to_a_bound() {
+    use psr_lan::ctrl::MessageType;
+    let code = |t: MessageType| t.code().to_be_bytes().to_vec();
+    let mut frames: Vec<Vec<u8>> = (0..70).map(|i| [code(MessageType::DisplayDevices), vec![i]].concat()).collect();
+    frames.push(code(MessageType::SwitchToStreamConnection));
+    let (mut s, _) = scripted_session(true, frames);
+    let others = s.switch_to_stream(std::time::Duration::from_secs(5)).unwrap();
+    assert_eq!(others.len(), session::SWITCH_EVENTS_MAX);
+}

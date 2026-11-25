@@ -115,7 +115,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 counts.ended.unwrap_or("still up")
             );
 
-            let mut stream = psn_session::open_stream(&mut ctrl, data, &VideoProfile::p720_60(Codec::H264))?;
+            let (mut stream, _waited) = psn_session::open_stream(&mut ctrl, data, &VideoProfile::p720_60(Codec::H264))?;
             println!(
                 "{}  stream connected on the data hole: {} resolutions offered",
                 t(),
