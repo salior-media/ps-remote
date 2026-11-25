@@ -226,3 +226,18 @@ fn push_context_ids_are_random_version_4_uuids() {
     assert!(parts[2].starts_with('4'), "version 4: {a}");
     assert!(matches!(parts[3].as_bytes()[0], b'8' | b'9' | b'a' | b'b'), "RFC 4122 variant: {a}");
 }
+
+#[test]
+fn a_pong_is_overdue_only_after_a_read_has_had_time_to_find_it() {
+    use psr_psn::push::{PING_INTERVAL, PONG_GRACE, pong_overdue};
+    use std::time::{Duration, Instant};
+    let ping = Instant::now();
+    let late = ping + PING_INTERVAL + Duration::from_millis(1);
+    assert!(!pong_overdue(false, ping, ping, late + PONG_GRACE * 2), "no ping waiting");
+    assert!(!pong_overdue(true, ping, ping, ping + PING_INTERVAL), "within the interval");
+    assert!(pong_overdue(true, ping, ping, late + PONG_GRACE), "a read that went on past both");
+    // The holepunch was away on UDP for ten seconds: the read that comes back still gets its grace.
+    let back = ping + Duration::from_secs(10);
+    assert!(!pong_overdue(true, ping, back, back + PONG_GRACE));
+    assert!(pong_overdue(true, ping, back, back + PONG_GRACE + Duration::from_millis(1)));
+}

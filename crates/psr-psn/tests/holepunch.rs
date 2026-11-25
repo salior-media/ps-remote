@@ -219,7 +219,7 @@ fn candidates_must_be_addresses_a_probe_may_go_to() {
 
 #[test]
 fn keys_have_chiaki_ngs_sizes_and_candidates_are_capped() {
-    for skey in [B64.encode([0u8; 15]), B64.encode([0u8; 17]), String::new(), "!!".to_string()] {
+    for skey in [B64.encode([0u8; 15]), B64.encode([0u8; 17]), "!!".to_string()] {
         let bad = OFFER.replace("AAECAwQFBgcICQoLDA0ODw==", &skey);
         assert!(matches!(offer(&bad), Err(PsnError::BadField("skey"))), "{skey:?}");
     }
@@ -272,4 +272,14 @@ fn the_consoles_malformed_messages_are_refused() {
     let no_mac = OFFER.replace("00:e4:21:2e:a0:07", "");
     assert_eq!(offer(&no_mac).unwrap().default_route_mac, None, "an empty MAC is none, as in chiaki-ng");
     assert!(holepunch::message_json(&Notification::parse(br#"{"dataType":"x","body":{}}"#).unwrap()).is_err());
+}
+
+#[test]
+fn an_empty_key_is_all_zeros_as_the_consoles_accept_sends_it() {
+    let accept = OFFER
+        .replace(r#""action":"OFFER""#, r#""action":"ACCEPT""#)
+        .replace("AQIDBAUGBwgJCgsMDQ4PEBESExQ=", "")
+        .replace("AAECAwQFBgcICQoLDA0ODw==", "");
+    let r = offer(&accept).unwrap();
+    assert_eq!((r.local_hashed_id, r.skey), ([0; 20], [0; 16]));
 }

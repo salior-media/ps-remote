@@ -6,9 +6,11 @@
 pub mod auth;
 pub mod devices;
 pub mod holepunch;
+pub mod punch;
 pub mod push;
 pub mod rps;
 pub mod secret;
+pub mod stun;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PsnError {

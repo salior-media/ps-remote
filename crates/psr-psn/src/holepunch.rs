@@ -40,7 +40,7 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-fn random<const N: usize>() -> Result<[u8; N], PsnError> {
+pub(crate) fn random<const N: usize>() -> Result<[u8; N], PsnError> {
     let mut b = [0u8; N];
     getrandom::fill(&mut b).map_err(|e| PsnError::Network(format!("random numbers: {e}")))?;
     Ok(b)
@@ -188,14 +188,21 @@ pub enum CandidateKind {
 }
 
 /// An address a side can perhaps be reached at (chiaki-ng `Candidate`). `addr` is checked to be one a probe may
-/// be sent to; `addr_mapped` is often `0.0.0.0` (none) and is only read, never sent to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// be sent to; `addr_mapped` is often `0.0.0.0` (none) and is only read, never sent to. Its `Debug` shows only
+/// the kind, so no address reaches a log.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Candidate {
     pub kind: CandidateKind,
     pub addr: IpAddr,
     pub addr_mapped: IpAddr,
     pub port: u16,
     pub port_mapped: u16,
+}
+
+impl std::fmt::Debug for Candidate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Candidate").field("kind", &self.kind).finish_non_exhaustive()
+    }
 }
 
 /// chiaki-ng `ConnectionRequest`.
@@ -290,8 +297,14 @@ fn parse_candidate(c: &serde_json::Value) -> Result<Candidate, PsnError> {
     Ok(Candidate { kind, addr, port, addr_mapped: ip("mappedAddr")?, port_mapped: int(c, "mappedPort")? })
 }
 
+/// A base64 field of exactly `N` bytes. An empty one is all zeros: chiaki-ng's decoder leaves its zeroed buffer
+/// as it is, and both its ACCEPT and the console's send `localHashedId` empty (seen live, 2026-11-25).
 fn fixed<const N: usize>(c: &serde_json::Value, field: &'static str) -> Result<[u8; N], PsnError> {
-    let bytes = B64.decode(text(c, field)?).map_err(|_| PsnError::BadField(field))?;
+    let text = text(c, field)?;
+    if text.is_empty() {
+        return Ok([0; N]);
+    }
+    let bytes = B64.decode(text).map_err(|_| PsnError::BadField(field))?;
     bytes.try_into().map_err(|_| PsnError::BadField(field))
 }
 
