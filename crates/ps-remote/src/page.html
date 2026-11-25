@@ -18,6 +18,7 @@
 <div class="row">
   <select id="console" aria-label="Console"><option>Looking for consoles…</option></select>
   <button id="play" disabled>Play</button>
+  <button id="playpsn">Play over PSN</button>
   <button id="stop">Stop</button>
 </div>
 <video id="video" autoplay playsinline muted></video>
@@ -96,6 +97,16 @@ async function play() {
   const choice = JSON.parse($("console").value);
   $("status").textContent = "Starting the session…";
   await api("/play", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(choice) });
+  await connectPeer();
+}
+
+async function playPsn() {
+  $("status").textContent = "Starting over PSN (around 40 seconds)…";
+  await api("/play-psn", { method: "POST" });
+  await connectPeer();
+}
+
+async function connectPeer() {
   if (pc) pc.close();
   pc = new RTCPeerConnection();
   pc.addTransceiver("video", { direction: "recvonly" });
@@ -118,6 +129,7 @@ async function showStatus() {
 }
 
 $("play").onclick = () => play().catch((e) => { $("status").textContent = String(e); });
+$("playpsn").onclick = () => playPsn().catch((e) => { $("status").textContent = String(e); });
 $("stop").onclick = async () => { if (pc) pc.close(); pc = null; channel = null; await api("/stop", { method: "POST" }); };
 $("sound").onclick = () => { $("video").muted = false; $("video").play(); };
 if (TOKEN) {
