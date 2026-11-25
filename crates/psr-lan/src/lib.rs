@@ -39,6 +39,8 @@ pub enum LanError {
     NeedsAccountId(Target),
     #[error("no RP-Version for {0:?}")]
     NoRpVersion(Target),
+    #[error("{0:?} cannot register over PSN; it registers at home with a PIN")]
+    NoPsnRegist(Target),
     #[error("the system random number generator failed: {0}")]
     Random(String),
     #[error("saved console file is invalid: {0}")]

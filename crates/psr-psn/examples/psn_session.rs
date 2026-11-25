@@ -3,8 +3,10 @@
 //! session, and waits for Sony's "created" and "joined" notifications.
 //!
 //! With `--start`, it then starts remote play on the account's PS5 (the one with Remote Play on), waits for the
-//! console to join and send its `customData1`, and punches the control hole. (The data hole comes later: the
-//! console offers it only once the control protocol runs over the control hole, step 9c.)
+//! console to join and send its `customData1`, punches the control hole, and registers through it (step
+//! 9c-1). It reports whether the console's keys match the ones saved when it was registered at home, never
+//! the keys. (The data hole comes later: the console offers it only once the control protocol runs over the
+//! control hole, step 9c-2.)
 //!
 //! Either way it leaves the session at the end. It prints what happened: counts and kinds, never addresses,
 //! account IDs, or tokens.
@@ -14,9 +16,11 @@
 use std::net::IpAddr;
 use std::time::Instant;
 
+use psr_crypto::Target;
 use psr_psn::holepunch;
 use psr_psn::punch::{Port, Puncher};
-use psr_psn::{auth, devices, push, rps, secret};
+use psr_psn::rudp::Rudp;
+use psr_psn::{auth, devices, push, regist, rps, secret};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let with_start = std::env::args().any(|a| a == "--start");
@@ -62,6 +66,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 t(),
                 hole.candidate.kind
             );
+            let local_ip = hole.local_ip;
+            let mut rudp = Rudp::new(hole.socket)?;
+            let done = regist::register(&mut rudp, Target::Ps5V1, session.created.account_id, &started, local_ip)?;
+            let consoles = dir.join("consoles");
+            let saved = psr_lan::store::load_all(&consoles).map_err(psr_psn::PsnError::Lan)?;
+            let same = match saved.iter().find(|h| h.server_mac == done.host.server_mac) {
+                Some(h) if h.rp_regist_key == done.host.rp_regist_key && h.rp_key == done.host.rp_key => "match",
+                Some(_) => "differ from",
+                None => "have nothing saved at home to compare with, for",
+            };
+            let finished = if done.finished { "and finished" } else { "without the console's FINISH" };
+            println!("{}  registered through the hole {finished}; its keys {same} the ones saved at home", t());
         }
         Ok(())
     })();

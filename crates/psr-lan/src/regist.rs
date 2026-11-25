@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Registration ("Link Device"): pairing this client with a console using the PIN it shows. Ported from
-//! chiaki-ng `lib/src/regist.c` (LicenseRef-AGPL-3.0-only-OpenSSL), home-network path. The PSN path
-//! (registering through Sony's servers) belongs with step 9.
+//! chiaki-ng `lib/src/regist.c` (LicenseRef-AGPL-3.0-only-OpenSSL), home-network path. Over PSN the same
+//! request goes through the punched hole instead (`psr-psn`'s `regist`), built by [`request_payload_psn`]
+//! and [`request_header_host`].
 //!
 //! 1. UDP `SRC3` (PS5) or `SRC2` (PS4) to port 9295, wait for `RES3`/`RES2`.
 //! 2. After 100 ms (the PS4 refuses requests that come sooner), TCP to the same address, port 9295.
@@ -89,13 +90,45 @@ pub fn request_payload(
         let key_1_off = usize::from(buf[0] >> 3);
         crypt = RpCrypt::regist(target, ambassador, key_0_off, pin)?;
         let aeropause = rpcrypt::aeropause(target, key_1_off, crypt.ambassador())?;
-        buf[0xc7..0xcf].copy_from_slice(&aeropause[8..]);
-        buf[0x191..0x199].copy_from_slice(&aeropause[..8]);
+        place_aeropause(&mut buf, &aeropause);
         // chiaki-ng drops the online ID from PS4 10 on, so it needs the account ID.
         if let Identity::OnlineId(_) = identity {
             return Err(LanError::NeedsAccountId(target));
         }
     }
+    Ok((finish_payload(buf, target, &crypt, identity), crypt))
+}
+
+/// The "aeropause" key where chiaki-ng puts it for PS4 10 and later: its second half, then its first.
+fn place_aeropause(buf: &mut [u8], aeropause: &rpcrypt::Key) {
+    buf[0xc7..0xcf].copy_from_slice(&aeropause[8..]);
+    buf[0x191..0x199].copy_from_slice(&aeropause[..8]);
+}
+
+/// chiaki-ng `chiaki_regist_request_payload_format` with `holepunch_info`: registering over PSN, where no
+/// PIN is shown and the cipher comes from the session's `customData1`, `data1` and `data2` instead. PS4 10
+/// and later, and the PS5, only (chiaki-ng takes the PIN path for older PS4s whatever is given).
+pub fn request_payload_psn(
+    target: Target,
+    ambassador: &rpcrypt::Key,
+    account_id: &[u8; PSN_ACCOUNT_ID_SIZE],
+    custom_data1: &rpcrypt::Key,
+    data1: &rpcrypt::Key,
+    data2: &rpcrypt::Key,
+) -> Result<(Vec<u8>, RpCrypt), LanError> {
+    if target.code() < Target::Ps4V10.code() {
+        return Err(LanError::NoPsnRegist(target));
+    }
+    let mut buf = vec![b'A'; INNER_HEADER_OFF];
+    let key_0_off = usize::from(buf[0x18d] & 0x1f);
+    let key_1_off = usize::from(buf[0] >> 3);
+    let crypt = RpCrypt::regist_psn(target, ambassador, key_0_off, custom_data1, data1, data2)?;
+    place_aeropause(&mut buf, &rpcrypt::aeropause_psn(target, key_1_off, crypt.ambassador())?);
+    Ok((finish_payload(buf, target, &crypt, &Identity::AccountId(*account_id)), crypt))
+}
+
+/// The filler and keys, then the inner header encrypted.
+fn finish_payload(mut buf: Vec<u8>, target: Target, crypt: &RpCrypt, identity: &Identity) -> Vec<u8> {
     let inner = match identity {
         Identity::OnlineId(id) => format!("Client-Type: Windows\r\nNp-Online-Id: {id}\r\n"),
         Identity::AccountId(id) => {
@@ -105,14 +138,19 @@ pub fn request_payload(
         }
     };
     buf.extend_from_slice(&crypt.encrypt(0, inner.as_bytes()));
-    Ok((buf, crypt))
+    buf
 }
 
 /// chiaki-ng `request_header_format`. The doubled ` HTTP/1.1` on the first line is chiaki-ng's, and is
 /// kept byte for byte: it is what the console has been accepting.
 pub fn request_header(target: Target, payload_len: usize) -> Result<String, LanError> {
+    request_header_host(target, payload_len, REGIST_LOCAL_ADDR)
+}
+
+/// [`request_header`] with another `HOST`: over PSN chiaki-ng sends this client's local address there.
+pub fn request_header_host(target: Target, payload_len: usize, host: &str) -> Result<String, LanError> {
     let mut h = format!(
-        "POST {} HTTP/1.1\r\n HTTP/1.1\r\nHOST: {REGIST_LOCAL_ADDR}\r\nUser-Agent: remoteplay Windows\r\nConnection: close\r\nContent-Length: {payload_len}\r\n",
+        "POST {} HTTP/1.1\r\n HTTP/1.1\r\nHOST: {host}\r\nUser-Agent: remoteplay Windows\r\nConnection: close\r\nContent-Length: {payload_len}\r\n",
         request_path(target)
     );
     if target.code() >= Target::Ps4V9.code() {
