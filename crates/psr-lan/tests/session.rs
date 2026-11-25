@@ -16,8 +16,10 @@ use psr_lan::ctrl::{self, CtrlCipher, CtrlEvent, Framer, MessageType};
 use psr_lan::regist::RegisteredHost;
 use psr_lan::session::{self, Codec};
 
-const NONCE: [u8; 16] = [0x91, 0x4c, 0x07, 0x3e, 0xa2, 0x5d, 0x11, 0xf0, 0x6b, 0x38, 0xc9, 0x02, 0x7a, 0xe4, 0x55, 0x1d];
-const MORNING: [u8; 16] = [0x2b, 0x84, 0xd3, 0x6f, 0x10, 0xaa, 0x9c, 0x47, 0xe5, 0x21, 0x0e, 0xb8, 0x73, 0x5a, 0xcd, 0x96];
+const NONCE: [u8; 16] =
+    [0x91, 0x4c, 0x07, 0x3e, 0xa2, 0x5d, 0x11, 0xf0, 0x6b, 0x38, 0xc9, 0x02, 0x7a, 0xe4, 0x55, 0x1d];
+const MORNING: [u8; 16] =
+    [0x2b, 0x84, 0xd3, 0x6f, 0x10, 0xaa, 0x9c, 0x47, 0xe5, 0x21, 0x0e, 0xb8, 0x73, 0x5a, 0xcd, 0x96];
 /// A registration key as consoles hand it out: the text of a hexadecimal number, zero-padded.
 const REGIST_KEY: [u8; 16] = *b"3a9f0c71\0\0\0\0\0\0\0\0";
 const DID: [u8; 32] = [7; 32];
@@ -80,7 +82,10 @@ fn session_response_nonce() {
 #[test]
 fn session_response_without_a_good_nonce_is_refused() {
     let none = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
-    assert!(matches!(session::parse_session_response(none.as_bytes()), Err(LanError::SessionRefused { code: 200, .. })));
+    assert!(matches!(
+        session::parse_session_response(none.as_bytes()),
+        Err(LanError::SessionRefused { code: 200, .. })
+    ));
     let short = format!("HTTP/1.1 200 OK\r\nRP-Nonce: {}\r\n\r\n", b64(&NONCE[..15]));
     assert!(matches!(session::parse_session_response(short.as_bytes()), Err(LanError::BadNonce)));
 }
@@ -96,7 +101,8 @@ fn session_response_in_use() {
 #[test]
 fn version_mismatch_names_the_consoles_version() {
     let refused = |reason: &str, version: &str| {
-        let reply = format!("HTTP/1.1 403 Forbidden\r\nRP-Application-Reason: {reason}\r\nRP-Version: {version}\r\n\r\n");
+        let reply =
+            format!("HTTP/1.1 403 Forbidden\r\nRP-Application-Reason: {reason}\r\nRP-Version: {version}\r\n\r\n");
         session::parse_session_response(reply.as_bytes()).unwrap_err()
     };
     assert_eq!(session::retry_target(&refused("80108b11", "9.0"), Target::Ps4V10), Some(Target::Ps4V9));
@@ -114,7 +120,8 @@ fn version_mismatch_names_the_consoles_version() {
 fn ctrl_request_ps5_fields_decrypt_in_order() {
     let console = crypt(Target::Ps5V1);
     let mut cipher = CtrlCipher::new(crypt(Target::Ps5V1));
-    let request = ctrl::ctrl_request(Target::Ps5V1, "192.168.0.9", &mut cipher, &REGIST_KEY, &DID, Codec::H264).unwrap();
+    let request =
+        ctrl::ctrl_request(Target::Ps5V1, "192.168.0.9", &mut cipher, &REGIST_KEY, &DID, Codec::H264).unwrap();
     assert!(request.starts_with("GET /sie/ps5/rp/sess/ctrl HTTP/1.1\r\nHost: 192.168.0.9:9295\r\n"), "{request}");
     assert!(request.ends_with("\r\n\r\n"));
     assert_eq!(header(&request, "Connection"), Some("keep-alive"));
@@ -275,7 +282,8 @@ fn fake_console(listener: TcpListener, session_id: &'static [u8]) -> std::thread
         let (mut s, _) = listener.accept().unwrap();
         let init = read_head(&mut s);
         assert!(init.starts_with("GET /sie/ps5/rp/sess/init "), "{init}");
-        s.write_all(format!("HTTP/1.1 200 OK\r\nRP-Nonce: {}\r\nContent-Length: 0\r\n\r\n", b64(&NONCE)).as_bytes()).unwrap();
+        s.write_all(format!("HTTP/1.1 200 OK\r\nRP-Nonce: {}\r\nContent-Length: 0\r\n\r\n", b64(&NONCE)).as_bytes())
+            .unwrap();
         drop(s);
 
         let (mut s, _) = listener.accept().unwrap();
@@ -369,4 +377,52 @@ fn fallback_session_id_is_74_characters() {
     let id = session::fallback_session_id(1_764_000_000, &[0x5a; 48]);
     assert_eq!(id.len(), 74);
     assert!(id.starts_with("1764000000"));
+}
+
+/// A link that keeps what is written and has nothing more to read.
+struct Quiet(std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
+
+impl session::CtrlLink for Quiet {
+    fn write(&mut self, frames: &[u8]) -> Result<(), LanError> {
+        self.0.lock().unwrap().push(frames.to_vec());
+        Ok(())
+    }
+
+    fn read(&mut self, timeout: std::time::Duration) -> Result<Vec<u8>, LanError> {
+        std::thread::sleep(timeout.min(std::time::Duration::from_millis(5)));
+        Ok(Vec::new())
+    }
+}
+
+#[test]
+fn what_came_after_the_ctrl_answer_is_read_and_empty_ids_and_heartbeat_floods_are_not_obeyed() {
+    use psr_lan::ctrl::{CtrlCipher, CtrlResponse, MessageType};
+    let crypt = psr_crypto::rpcrypt::RpCrypt::auth(Target::Ps5V1, &NONCE, &[0x52; 16]).unwrap();
+    let mut console = CtrlCipher::new(crypt.clone());
+    let id = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Zz";
+    let mut payload = vec![id.len() as u8];
+    payload.extend(id.as_bytes());
+    // Arrived with the ctrl answer: an empty session ID, two heartbeat requests back to back, the real ID.
+    let rest = [
+        console.seal(MessageType::SessionId.code(), &[]),
+        console.seal(MessageType::HeartbeatReq.code(), &[]),
+        console.seal(MessageType::HeartbeatReq.code(), &[]),
+        console.seal(MessageType::SessionId.code(), &payload),
+    ]
+    .concat();
+    let written = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let s = session::Session::over(
+        Box::new(Quiet(written.clone())),
+        Target::Ps5V1,
+        CtrlCipher::new(crypt),
+        &rest,
+        CtrlResponse { server_type: Some(2), prohibit: false },
+        None,
+    )
+    .unwrap();
+    assert_eq!(s.session_id(), id);
+    assert!(!s.session_id_was_fallback());
+    let types: Vec<u16> = written.lock().unwrap().iter().map(|f| u16::from_be_bytes([f[4], f[5]])).collect();
+    let heartbeats = types.iter().filter(|t| **t == MessageType::HeartbeatRep.code()).count();
+    assert_eq!(heartbeats, 1, "{types:x?}");
 }

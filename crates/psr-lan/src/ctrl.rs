@@ -140,12 +140,25 @@ pub fn ctrl_request(
     did: &[u8; 32],
     codec: Codec,
 ) -> Result<String, LanError> {
+    ctrl_request_port(target, host, SESSION_PORT, cipher, regist_key, did, codec)
+}
+
+/// [`ctrl_request`] naming another port in `Host`, as over PSN.
+pub fn ctrl_request_port(
+    target: Target,
+    host: &str,
+    port: u16,
+    cipher: &mut CtrlCipher,
+    regist_key: &[u8; 16],
+    did: &[u8; 32],
+    codec: Codec,
+) -> Result<String, LanError> {
     let version = rp_version(target).ok_or(LanError::NoRpVersion(target))?;
     let auth = cipher.field(regist_key);
     let did = cipher.field(did);
     let os_type = cipher.field(OS_TYPE);
     let mut r = format!(
-        "GET {} HTTP/1.1\r\nHost: {host}:{SESSION_PORT}\r\nUser-Agent: remoteplay Windows\r\nConnection: keep-alive\r\n\
+        "GET {} HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: remoteplay Windows\r\nConnection: keep-alive\r\n\
          Content-Length: 0\r\nRP-Auth: {auth}\r\nRP-Version: {version}\r\nRP-Did: {did}\r\nRP-ControllerType: 3\r\n\
          RP-ClientType: 11\r\nRP-OSType: {os_type}\r\nRP-ConPath: 1\r\n",
         request_path(target)

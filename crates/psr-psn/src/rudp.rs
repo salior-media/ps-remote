@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! RUDP: the console's reliable-datagram framing over the punched control hole, which carries registration,
 //! the session request and ctrl when playing over PSN. Ported from chiaki-ng `lib/src/remote/rudp.c`
-//! (LicenseRef-AGPL-3.0-only-OpenSSL). Step 9c-1 needs the handshake and the HTTP exchange; ctrl messages and
-//! the send buffer come with the ctrl in 9c-2.
+//! (LicenseRef-AGPL-3.0-only-OpenSSL), and its send buffer from `rudpsendbuffer.c`. Step 9c-1 uses the
+//! handshake and the HTTP exchange; 9c-2 carries ctrl over it ([`Rudp`] is a `psr_lan` ctrl link), with what
+//! chiaki-ng's `ctrl.c` does with each message that arrives ([`incoming`]).
 //!
 //! A message is an 8-byte header — `0xC000 | (8 + data length)`, the constant `0x244F244F`, the type — then
 //! its data. A datagram may chain a second message after the first's data. Most types' data starts with
@@ -28,8 +29,24 @@
 //! - **A request too long for one message is refused** rather than sent with its 12-bit length cut short.
 //! - **A connection reset is waited out**, 10 ms at a time, where the loop would otherwise spin until the try
 //!   ends (Windows reports an ICMP port-unreachable on the next receive).
+//! - **One ACK per datagram.** chiaki-ng's ctrl loop sends an ACK for every message of a chain that asks for
+//!   one, each naming the same counter; here the first is sent and the repeats are not.
+//! - **A datagram whose counter is not new is not read again** (the security review's finding). It is still
+//!   acknowledged, so the console stops resending it, but its frames are passed over: read twice, a frame
+//!   would advance the ctrl cipher's counter and garble every message after it.
+//! - **A frame too long for ctrl's 512 bytes is passed over** with its datagram's other frames kept, where it
+//!   would end ctrl.
+//! - **A message given up on is reported**: after [`RESEND_TRIES_MAX`] resends unacknowledged, reading ctrl
+//!   fails, where chiaki-ng drops the message and carries on as though the console were there.
+//! - **The send buffer is resent from the ctrl loop**, when it reads, not from a thread of its own. The ctrl
+//!   loop reads in steps of at most [`RESEND_WAKE`], chiaki-ng's resend thread's wake-up, so the timing is
+//!   the same while ctrl is polled.
 
 use std::net::UdpSocket;
+
+use psr_lan::LanError;
+use psr_lan::ctrl::MAX_FRAME;
+use psr_lan::session::CtrlLink;
 use std::time::{Duration, Instant};
 
 use crate::{PsnError, holepunch, stun};
@@ -216,6 +233,9 @@ pub struct Rudp {
     sock: UdpSocket,
     counter: u16,
     header: u32,
+    sent: SendBuffer,
+    /// The console's counter on the last datagram whose frames were read.
+    last_read: Option<u16>,
 }
 
 impl std::fmt::Debug for Rudp {
@@ -237,7 +257,7 @@ impl Rudp {
 
     /// Given counter and header word, for tests.
     pub fn with(sock: UdpSocket, counter: u16, header: u32) -> Self {
-        Rudp { sock, counter, header }
+        Rudp { sock, counter, header, sent: SendBuffer::default(), last_read: None }
     }
 
     pub fn counter(&self) -> u16 {
@@ -334,6 +354,266 @@ impl Rudp {
     pub fn finish(&mut self, remote_counter: u16) -> Result<(), PsnError> {
         self.send_recv(Send::Ack { remote_counter }, Expect::Finish, 0).map(drop)
     }
+}
+
+/// chiaki-ng `RUDP_DATA_RESEND_TIMEOUT_MS`: a ctrl message not acknowledged in this time is sent again.
+pub const RESEND_TIMEOUT: Duration = Duration::from_millis(400);
+/// chiaki-ng `RUDP_DATA_RESEND_WAKEUP_TIMEOUT_MS`.
+pub const RESEND_WAKE: Duration = Duration::from_millis(200);
+/// chiaki-ng `RUDP_DATA_RESEND_TRIES_MAX`: after this many resends a message is given up on.
+pub const RESEND_TRIES_MAX: u32 = 25;
+/// chiaki-ng `RUDP_SEND_BUFFER_SIZE`: messages waiting for their acknowledgment at once.
+pub const SEND_BUFFER_SIZE: usize = 16;
+
+/// chiaki-ng `chiaki_rudp_send_ctrl_message`: our counter, then the ctrl frames.
+pub fn ctrl_message(counter: u16, frames: &[u8]) -> Vec<u8> {
+    serialize(&[(CTRL_MESSAGE, &[&counter.to_be_bytes()[..], frames].concat())])
+}
+
+/// chiaki-ng `chiaki_seq_num_16_lt`: `a` comes before `b`, counting round the wrap.
+pub fn seq_lt(a: u16, b: u16) -> bool {
+    (1..0x8000).contains(&b.wrapping_sub(a))
+}
+
+struct Pending {
+    seq: u16,
+    tries: u32,
+    last_send: Instant,
+    datagram: Vec<u8>,
+}
+
+/// chiaki-ng `ChiakiRudpSendBuffer`: our ctrl messages until the console acknowledges them, each under the
+/// counter after its own, which is what the console's acknowledgment names.
+#[derive(Default)]
+pub struct SendBuffer {
+    pending: Vec<Pending>,
+}
+
+impl SendBuffer {
+    /// chiaki-ng `chiaki_rudp_send_buffer_push`: refused when full or when `seq` is already waiting.
+    pub fn push(&mut self, seq: u16, datagram: Vec<u8>, now: Instant) -> Result<(), PsnError> {
+        if self.pending.len() >= SEND_BUFFER_SIZE {
+            return Err(PsnError::Rudp("too many ctrl messages wait for the console's acknowledgment"));
+        }
+        if self.pending.iter().any(|p| p.seq == seq) {
+            return Err(PsnError::Rudp("a ctrl message with that counter already waits"));
+        }
+        self.pending.push(Pending { seq, tries: 0, last_send: now, datagram });
+        Ok(())
+    }
+
+    /// chiaki-ng `chiaki_rudp_send_buffer_ack`: `seq` and everything before it are done with.
+    pub fn ack(&mut self, seq: u16) {
+        self.pending.retain(|p| p.seq != seq && !seq_lt(p.seq, seq));
+    }
+
+    /// chiaki-ng `rudp_send_buffer_resend`: what to send again now, and whether a message was given up on. A
+    /// message resent [`RESEND_TRIES_MAX`] times is dropped, with everything before it, as chiaki-ng does.
+    pub fn due(&mut self, now: Instant) -> (Vec<Vec<u8>>, bool) {
+        let gave_up = if let Some(seq) = self
+            .pending
+            .iter()
+            .filter(|p| now.duration_since(p.last_send) > RESEND_TIMEOUT && p.tries >= RESEND_TRIES_MAX)
+            .map(|p| p.seq)
+            .next_back()
+        {
+            self.ack(seq);
+            true
+        } else {
+            false
+        };
+        let mut out = Vec::new();
+        for p in self.pending.iter_mut().filter(|p| now.duration_since(p.last_send) > RESEND_TIMEOUT) {
+            p.tries += 1;
+            p.last_send = now;
+            out.push(p.datagram.clone());
+        }
+        (out, gave_up)
+    }
+
+    pub fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+}
+
+/// What one datagram means to ctrl (chiaki-ng `ctrl_thread_func`, the RUDP branch). Its `Debug` shows the
+/// frames' length, not their bytes.
+#[derive(Default, Clone, PartialEq, Eq)]
+pub struct Incoming {
+    /// The console's counter on the first message, which says whether the datagram is new.
+    pub counter: Option<u16>,
+    /// Our messages the console acknowledges, by the counter each names.
+    pub acked: Vec<u16>,
+    /// The counter to acknowledge, when a message asks for it: the first message's, plus one.
+    pub ack: Option<u16>,
+    /// Ctrl frames, header and payload, in order.
+    pub frames: Vec<u8>,
+    /// The console sent FINISH: ctrl is over.
+    pub finished: bool,
+}
+
+impl std::fmt::Debug for Incoming {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Incoming")
+            .field("counter", &self.counter)
+            .field("acked", &self.acked)
+            .field("ack", &self.ack)
+            .field("frames_len", &self.frames.len())
+            .field("finished", &self.finished)
+            .finish()
+    }
+}
+
+/// chiaki-ng `rudp_packet_type_data_offset`, where the ctrl frame starts in a message of this subtype.
+fn frame_offset(subtype: u8) -> usize {
+    match subtype {
+        0x12 => 8,
+        0x26 => 6,
+        _ => 2,
+    }
+}
+
+/// chiaki-ng's ctrl loop over each message of a chain. A message whose data is shorter than its two
+/// counters is passed over (FINISH apart). A frame is taken only when its header's length is exactly the
+/// rest of the message, as chiaki-ng checks.
+pub fn incoming(messages: &[Message]) -> Incoming {
+    let mut r = Incoming {
+        counter: messages.first().and_then(Message::remote_counter).map(|c| c.wrapping_sub(1)),
+        ..Incoming::default()
+    };
+    let ack_to = messages.first().and_then(Message::remote_counter).unwrap_or(0);
+    let take = |m: &Message, offset: usize, r: &mut Incoming| {
+        r.ack = Some(ack_to);
+        let Some(frame) = m.data.get(offset..).filter(|f| f.len() >= 8) else { return };
+        let len = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]);
+        // chiaki-ng's length check, and ctrl's buffer size, which a longer frame would overflow.
+        if frame.len() <= MAX_FRAME && usize::try_from(len).is_ok_and(|l| l == frame.len() - 8) {
+            r.frames.extend_from_slice(frame);
+        }
+    };
+    for m in messages {
+        let s = m.subtype();
+        if m.data.len() < 4 && s != 0xC0 {
+            continue;
+        }
+        let acked = || u16::from_be_bytes([m.data[2], m.data[3]]);
+        match s {
+            0x12 | 0x26 | 0x36 => {
+                r.acked.push(acked());
+                take(m, frame_offset(s), &mut r);
+            }
+            0x02 => take(m, frame_offset(s), &mut r),
+            0x24 => r.acked.push(acked()),
+            0xC0 => r.finished = true,
+            // chiaki-ng: an unknown kind is acknowledged, retires nothing, and may carry a frame at 4.
+            _ => take(m, 4, &mut r),
+        }
+    }
+    r
+}
+
+impl Rudp {
+    /// chiaki-ng `chiaki_rudp_send_ack_message`, on its own.
+    pub fn send_ack(&mut self, remote_counter: u16) -> Result<(), PsnError> {
+        self.sock.send(&ack(self.counter, remote_counter)).map(drop).map_err(io)
+    }
+
+    /// chiaki-ng `chiaki_rudp_send_ctrl_message`: sent now, and again until the console acknowledges it.
+    pub fn send_ctrl(&mut self, frames: &[u8]) -> Result<(), PsnError> {
+        if frames.len() + 2 > MAX_DATA {
+            return Err(PsnError::Rudp("the ctrl message is too long for one RUDP message"));
+        }
+        // Checked before the counter is taken and the message sent, so a refusal leaves nothing half done.
+        if self.sent.len() >= SEND_BUFFER_SIZE {
+            return Err(PsnError::Rudp("too many ctrl messages wait for the console's acknowledgment"));
+        }
+        let counter = self.next_counter();
+        let datagram = ctrl_message(counter, frames);
+        self.sock.send(&datagram).map_err(io)?;
+        self.sent.push(self.counter, datagram, Instant::now())
+    }
+
+    /// Our ctrl messages still waiting for the console's acknowledgment.
+    pub fn unacknowledged(&self) -> usize {
+        self.sent.len()
+    }
+
+    /// Ctrl frames that arrive within `timeout`, acknowledging what asks for it, taking the console's
+    /// acknowledgments, and resending what is due while it waits. Empty if nothing came.
+    pub fn read_ctrl(&mut self, timeout: Duration) -> Result<Vec<u8>, PsnError> {
+        let deadline = Instant::now() + timeout;
+        let mut buf = [0u8; RECV_LEN];
+        loop {
+            let now = Instant::now();
+            let (resends, gave_up) = self.sent.due(now);
+            if gave_up {
+                return Err(PsnError::Rudp("the console stopped acknowledging our ctrl messages"));
+            }
+            for datagram in resends {
+                // A resend that fails is tried again at the next.
+                let _ = self.sock.send(&datagram);
+            }
+            if now >= deadline {
+                return Ok(Vec::new());
+            }
+            let wait = (deadline - now).min(RESEND_WAKE).max(Duration::from_millis(1));
+            self.sock.set_read_timeout(Some(wait)).map_err(io)?;
+            let n = match self.sock.recv(&mut buf) {
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                    std::thread::sleep(RESET_PAUSE);
+                    continue;
+                }
+                Err(e) if stun::is_transient(&e) => continue,
+                Err(e) => return Err(io(e)),
+            };
+            let got = incoming(&parse(&buf[..n]));
+            for seq in &got.acked {
+                self.sent.ack(*seq);
+            }
+            if let Some(remote) = got.ack {
+                // As a resend: an ACK that cannot go out now is sent again when the console resends.
+                let _ = self.send_ack(remote);
+            }
+            if got.finished {
+                return Err(PsnError::Finished);
+            }
+            if got.frames.is_empty() {
+                continue;
+            }
+            // Read once only (see the module notes); a datagram with no counter cannot be told apart, so it is
+            // read as chiaki-ng reads it.
+            if let Some(c) = got.counter {
+                if self.last_read.is_some_and(|last| !seq_lt(last, c)) {
+                    continue;
+                }
+                self.last_read = Some(c);
+            }
+            return Ok(got.frames);
+        }
+    }
+}
+
+/// Ctrl over the hole: [`psr_lan::session::Session`] runs on this as it does on TCP at home.
+impl CtrlLink for Rudp {
+    fn write(&mut self, frames: &[u8]) -> Result<(), LanError> {
+        self.send_ctrl(frames).map_err(lan)
+    }
+
+    fn read(&mut self, timeout: Duration) -> Result<Vec<u8>, LanError> {
+        match self.read_ctrl(timeout) {
+            Err(PsnError::Finished) => Err(LanError::CtrlClosed),
+            other => other.map_err(lan),
+        }
+    }
+}
+
+fn lan(e: PsnError) -> LanError {
+    LanError::Io(std::io::Error::other(e.to_string()))
 }
 
 fn io(e: std::io::Error) -> PsnError {

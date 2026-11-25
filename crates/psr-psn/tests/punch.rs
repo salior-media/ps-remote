@@ -280,7 +280,8 @@ fn an_address_at_an_ip_not_offered_is_passed_over() {
     let (offered_sock, offered_addr) = bind();
     // Another loopback address stands for another host.
     let stranger = UdpSocket::bind((Ipv4Addr::new(127, 0, 0, 2), 0)).unwrap();
-    stranger.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+    // Off the resend boundary (see `only_a_request_makes_a_derived_candidate`).
+    stranger.set_read_timeout(Some(punch::SELECT_TIMEOUT + punch::SELECT_TIMEOUT / 2)).unwrap();
     let t = thread::spawn(move || {
         let (req, _) = recv(&offered_sock);
         stranger.send_to(&punch::request_packet(&CONSOLE, &OURS, &[1; 5]), our_addr).unwrap();
@@ -362,7 +363,9 @@ fn only_a_request_makes_a_derived_candidate() {
     let (offered_sock, offered_addr) = bind();
     let (other, _) = bind();
     // Longer than the resend interval: a candidate made from this datagram would get our request on the resend.
-    other.set_read_timeout(Some(punch::SELECT_TIMEOUT * 3)).unwrap();
+    // Off the resend boundary by half an interval: on Windows an answer arriving just as a receive's
+    // timeout runs out can be lost (6 runs in 20 failed exactly on it, none in 20 off it; docs/PSN.md, 9c-2).
+    other.set_read_timeout(Some(punch::SELECT_TIMEOUT * 3 + punch::SELECT_TIMEOUT / 2)).unwrap();
     let t = thread::spawn(move || {
         let (req, _) = recv(&offered_sock);
         // A response-shaped datagram from a new port at the console's IP: not a request, so nothing back.
