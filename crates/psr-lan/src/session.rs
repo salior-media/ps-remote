@@ -94,11 +94,17 @@ fn request_path(target: Target) -> &'static str {
 /// `k` to `p` instead of `a` to `f`. Real registration keys are the text of a hex number, whose bytes have
 /// no such nibble, so the two agree on every key a console hands out; this port writes correct hex.
 pub fn session_request(target: Target, host: &str, regist_key: &[u8; 16]) -> Result<String, LanError> {
+    session_request_port(target, host, SESSION_PORT, regist_key)
+}
+
+/// [`session_request`] naming another port in `Host`: over PSN chiaki-ng names the console's end of the
+/// punched control hole.
+pub fn session_request_port(target: Target, host: &str, port: u16, regist_key: &[u8; 16]) -> Result<String, LanError> {
     let version = rp_version(target).ok_or(LanError::NoRpVersion(target))?;
     let end = regist_key.iter().position(|&b| b == 0).unwrap_or(regist_key.len());
     let key: String = regist_key[..end].iter().map(|b| format!("{b:02x}")).collect();
     Ok(format!(
-        "GET {} HTTP/1.1\r\nHost: {host}:{SESSION_PORT}\r\nUser-Agent: remoteplay Windows\r\nConnection: close\r\n\
+        "GET {} HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: remoteplay Windows\r\nConnection: close\r\n\
          Content-Length: 0\r\nRP-Registkey: {key}\r\nRp-Version: {version}\r\n\r\n",
         request_path(target)
     ))
@@ -203,13 +209,17 @@ pub fn fallback_session_id(seconds: u64, random: &[u8; 48]) -> String {
 /// [`Session::poll`]: it answers the console's heartbeats, and the console ends the session when they stop.
 pub struct Session {
     target: Target,
-    stream: TcpStream,
+    link: Box<dyn CtrlLink>,
     cipher: CtrlCipher,
     framer: Framer,
     session_id: String,
     session_id_was_fallback: bool,
     server_type: Option<u8>,
     prohibit: bool,
+    /// Over RUDP chiaki-ng also sends a heartbeat reply on its own this often, once the console has asked
+    /// for one (`CTRL_RUDP_HEARTBEAT_REP_INTERVAL_MS`).
+    heartbeat_every: Option<Duration>,
+    last_heartbeat: Option<Instant>,
 }
 
 impl std::fmt::Debug for Session {
@@ -258,25 +268,68 @@ pub fn start_at(addr: SocketAddr, console: &RegisteredHost, codec: Codec, did: &
         other => other?,
     };
     let response = ctrl::parse_ctrl_response(&head, &mut cipher)?;
-    let mut framer = Framer::default();
-    framer.push(&rest)?;
+    Session::over(Box::new(TcpLink(stream)), target, cipher, &rest, response, None)
+}
 
-    let mut session = Session {
-        target,
-        stream,
-        cipher,
-        framer,
-        session_id: String::new(),
-        session_id_was_fallback: false,
-        server_type: response.server_type,
-        prohibit: response.prohibit,
-    };
-    session.await_session_id()?;
-    session.enable_features()?;
-    Ok(session)
+/// How ctrl frames travel: a TCP connection at home, the punched hole's RUDP over PSN (`psr-psn`).
+pub trait CtrlLink: Send {
+    /// Sends ctrl frames, as [`CtrlCipher::seal`] makes them.
+    fn write(&mut self, frames: &[u8]) -> Result<(), LanError>;
+    /// What arrives within `timeout`, as ctrl frame bytes: nothing if it ran out first. The console
+    /// closing the channel is [`LanError::CtrlClosed`].
+    fn read(&mut self, timeout: Duration) -> Result<Vec<u8>, LanError>;
+}
+
+/// The home network's ctrl connection.
+struct TcpLink(TcpStream);
+
+impl CtrlLink for TcpLink {
+    fn write(&mut self, frames: &[u8]) -> Result<(), LanError> {
+        self.0.write_all(frames).map_err(io)
+    }
+
+    fn read(&mut self, timeout: Duration) -> Result<Vec<u8>, LanError> {
+        let mut chunk = [0u8; ctrl::MAX_FRAME];
+        self.0.set_read_timeout(Some(timeout.max(Duration::from_millis(1)))).map_err(io)?;
+        match self.0.read(&mut chunk) {
+            Ok(0) => Err(LanError::CtrlClosed),
+            Ok(n) => Ok(chunk[..n].to_vec()),
+            Err(e) if is_timeout(&e) => Ok(Vec::new()),
+            Err(e) => Err(io(e)),
+        }
+    }
 }
 
 impl Session {
+    /// The rest of chiaki-ng's ctrl start once the ctrl request has its answer, on any link: `rest` is what
+    /// arrived after the answer's header. Waits for the console's session ID, then enables the features.
+    pub fn over(
+        link: Box<dyn CtrlLink>,
+        target: Target,
+        cipher: CtrlCipher,
+        rest: &[u8],
+        response: ctrl::CtrlResponse,
+        heartbeat_every: Option<Duration>,
+    ) -> Result<Session, LanError> {
+        let mut framer = Framer::default();
+        framer.push(rest)?;
+        let mut session = Session {
+            target,
+            link,
+            cipher,
+            framer,
+            session_id: String::new(),
+            session_id_was_fallback: false,
+            server_type: response.server_type,
+            prohibit: response.prohibit,
+            heartbeat_every,
+            last_heartbeat: None,
+        };
+        session.await_session_id()?;
+        session.enable_features()?;
+        Ok(session)
+    }
+
     pub fn target(&self) -> Target {
         self.target
     }
@@ -309,7 +362,23 @@ impl Session {
     /// Sends one ctrl message.
     pub fn send(&mut self, message_type: u16, payload: &[u8]) -> Result<(), LanError> {
         let frame = self.cipher.seal(message_type, payload);
-        self.stream.write_all(&frame).map_err(io)
+        self.link.write(&frame)
+    }
+
+    fn send_heartbeat(&mut self) -> Result<(), LanError> {
+        self.send(MessageType::HeartbeatRep.code(), &[])?;
+        self.last_heartbeat = Some(Instant::now());
+        Ok(())
+    }
+
+    /// The heartbeat reply chiaki-ng sends unasked over RUDP, when one is due.
+    fn heartbeat_if_due(&mut self) -> Result<(), LanError> {
+        if let (Some(every), Some(last)) = (self.heartbeat_every, self.last_heartbeat)
+            && last.elapsed() >= every
+        {
+            self.send_heartbeat()?;
+        }
+        Ok(())
     }
 
     fn await_session_id(&mut self) -> Result<(), LanError> {
@@ -360,23 +429,24 @@ impl Session {
     /// Reads what has arrived within `timeout` and returns the messages, having already answered any
     /// heartbeat request.
     pub fn poll(&mut self, timeout: Duration) -> Result<Vec<CtrlEvent>, LanError> {
+        self.heartbeat_if_due()?;
         let mut events = self.drain()?;
         if events.is_empty() {
-            self.read_some(timeout)?;
+            // Wake for the next unasked heartbeat, if it comes before the timeout.
+            let until_heartbeat = match (self.heartbeat_every, self.last_heartbeat) {
+                (Some(every), Some(last)) => every.saturating_sub(last.elapsed()),
+                _ => timeout,
+            };
+            self.read_some(timeout.min(until_heartbeat))?;
             events = self.drain()?;
         }
+        self.heartbeat_if_due()?;
         Ok(events)
     }
 
     fn read_some(&mut self, timeout: Duration) -> Result<(), LanError> {
-        let mut chunk = [0u8; ctrl::MAX_FRAME];
-        self.stream.set_read_timeout(Some(timeout.max(Duration::from_millis(1)))).map_err(io)?;
-        match self.stream.read(&mut chunk) {
-            Ok(0) => Err(LanError::CtrlClosed),
-            Ok(n) => self.framer.push(&chunk[..n]),
-            Err(e) if is_timeout(&e) => Ok(()),
-            Err(e) => Err(io(e)),
-        }
+        let bytes = self.link.read(timeout)?;
+        self.framer.push(&bytes)
     }
 
     fn drain(&mut self) -> Result<Vec<CtrlEvent>, LanError> {
@@ -384,7 +454,7 @@ impl Session {
         while let Some((ty, payload)) = self.framer.next_frame() {
             let event = ctrl::event(ty, &self.cipher.open(&payload));
             if event == CtrlEvent::HeartbeatRequested {
-                self.send(MessageType::HeartbeatRep.code(), &[])?;
+                self.send_heartbeat()?;
             }
             events.push(event);
         }
