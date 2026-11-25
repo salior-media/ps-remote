@@ -6,7 +6,8 @@
 //! console to join and send its `customData1`, punches the control hole, and registers through it (step
 //! 9c-1), reporting whether the console's keys match the ones saved when it was registered at home, never the
 //! keys. Then (step 9c-2) it starts the session and ctrl through the hole, and, with ctrl kept answered on a
-//! thread, punches the data hole, then keeps ctrl up for [`CTRL_HOLD`] to see the heartbeats go both ways.
+//! thread, punches the data hole. Then (step 9c-3) it switches to the stream connection on the data hole and
+//! streams for [`STREAM_FOR`], counting what arrives: frames, audio, losses. Nothing is decoded or shown.
 //!
 //! Either way it leaves the session at the end. It prints what happened: counts and kinds, never addresses,
 //! account IDs, or tokens.
@@ -17,8 +18,10 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use psr_av::video::VideoEvent;
 use psr_lan::ctrl::CtrlEvent;
 use psr_lan::session::{Codec, Session};
+use psr_lan::stream::{StreamEvent, VideoProfile};
 
 use psr_crypto::Target;
 use psr_psn::holepunch;
@@ -26,8 +29,10 @@ use psr_psn::punch::{Port, Puncher};
 use psr_psn::rudp::Rudp;
 use psr_psn::{auth, devices, push, regist, rps, secret, session as psn_session};
 
-/// How long ctrl is kept up after the data hole, to see the heartbeats.
-const CTRL_HOLD: Duration = Duration::from_secs(12);
+/// How long the stream runs.
+const STREAM_FOR: Duration = Duration::from_secs(15);
+/// How often ctrl is polled while the stream runs, as the app does (`runner.rs`).
+const CTRL_INTERVAL: Duration = Duration::from_millis(100);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let with_start = std::env::args().any(|a| a == "--start");
@@ -96,9 +101,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (data, counts) = std::thread::scope(|scope| {
                 let poller = scope.spawn(|| keep_answering(&mut ctrl, &stop));
                 let data = puncher.punch(&mut ws, Port::Data);
-                if data.is_ok() {
-                    std::thread::sleep(CTRL_HOLD);
-                }
                 stop.store(true, Ordering::Relaxed);
                 (data, poller.join())
             });
@@ -112,6 +114,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 counts.other,
                 counts.ended.unwrap_or("still up")
             );
+
+            let (mut stream, _waited) = psn_session::open_stream(&mut ctrl, data, &VideoProfile::p720_60(Codec::H264))?;
+            println!(
+                "{}  stream connected on the data hole: {} resolutions offered",
+                t(),
+                stream.info().resolutions.len()
+            );
+            let (mut headers, mut frames, mut bytes, mut audio, mut lost_reports, mut other) = (0, 0, 0usize, 0, 0, 0);
+            let mut ended = None;
+            let begun = Instant::now();
+            let mut last_ctrl = Instant::now();
+            while begun.elapsed() < STREAM_FOR && ended.is_none() {
+                for e in stream.poll(Duration::from_millis(5)).map_err(psr_psn::PsnError::Lan)? {
+                    match e {
+                        StreamEvent::Video(VideoEvent::Header { .. }) => headers += 1,
+                        StreamEvent::Video(VideoEvent::Frame(f)) => {
+                            frames += 1;
+                            bytes += f.data.len();
+                        }
+                        StreamEvent::Video(_) => lost_reports += 1,
+                        StreamEvent::Audio(_) => audio += 1,
+                        StreamEvent::Message(_) => other += 1,
+                        StreamEvent::Disconnected(_) => ended = Some("the console ended it"),
+                    }
+                }
+                if last_ctrl.elapsed() >= CTRL_INTERVAL {
+                    ctrl.poll(Duration::from_millis(1)).map_err(psr_psn::PsnError::Lan)?;
+                    last_ctrl = Instant::now();
+                }
+            }
+            let secs = begun.elapsed().as_secs_f64();
+            let (lost, dropped) = (stream.frames_lost(), stream.dropped());
+            println!(
+                "{}  streamed {secs:.1} s: {headers} codec headers, {frames} video frames ({:.1}/s, {} KiB), {audio} audio frames, {lost} frames lost ({lost_reports} reports), {dropped} datagrams dropped, {other} other messages; {}",
+                t(),
+                frames as f64 / secs,
+                bytes / 1024,
+                ended.unwrap_or("we stopped it")
+            );
+            let _ = stream.disconnect();
         }
         Ok(())
     })();

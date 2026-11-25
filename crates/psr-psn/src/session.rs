@@ -12,19 +12,28 @@
 //! request (`ctrl_connect`'s `crypt_counter_local++` under `session->rudp`).
 
 use std::net::SocketAddrV4;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use psr_crypto::Target;
 use psr_crypto::rpcrypt::RpCrypt;
-use psr_lan::ctrl::{self, CtrlCipher};
+use psr_lan::ctrl::{self, CtrlCipher, CtrlEvent};
 use psr_lan::regist::RegisteredHost;
 use psr_lan::session::{self as lan, Codec, Session};
+use psr_lan::stream::{self, Stream, VideoProfile};
 
 use crate::PsnError;
+use crate::punch::Hole;
 use crate::rudp::Rudp;
 
 /// chiaki-ng `CTRL_RUDP_HEARTBEAT_REP_INTERVAL_MS`.
 pub const HEARTBEAT_EVERY: Duration = Duration::from_millis(4950);
+/// chiaki-ng `SESSION_EXPECT_TIMEOUT_MS`: how long the console has to acknowledge the switch to the stream.
+pub const SWITCH_TIMEOUT: Duration = Duration::from_secs(5);
+/// chiaki-ng `takion_read_extra_sock_messages`: what is left of the holepunch on the data hole is read and
+/// dropped until this long passes with none, or [`DRAIN_MAX`] in all.
+pub const DRAIN_QUIET: Duration = Duration::from_millis(200);
+pub const DRAIN_MAX: Duration = Duration::from_secs(1);
+const RESET_PAUSE: Duration = Duration::from_millis(1);
 /// chiaki-ng: "PS4 doesn't always react right away, sleep a bit".
 const BEFORE_CTRL_DELAY: Duration = Duration::from_millis(10);
 
@@ -90,4 +99,49 @@ pub fn start(
     let response = ctrl::parse_ctrl_response(head, &mut cipher).map_err(PsnError::Lan)?;
     let rest = rest.to_vec();
     Session::over(Box::new(rudp), target, cipher, &rest, response, Some(HEARTBEAT_EVERY)).map_err(PsnError::Lan)
+}
+
+/// chiaki-ng `takion_read_extra_sock_messages`: drops what is waiting on the data hole (the holepunch's last
+/// requests), so the stream's handshake reads only the stream. How many were dropped.
+pub fn drain(sock: &std::net::UdpSocket) -> Result<usize, PsnError> {
+    let end = Instant::now() + DRAIN_MAX;
+    let mut buf = [0u8; 1500];
+    let mut dropped = 0;
+    loop {
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(dropped);
+        }
+        match psr_lan::udp::recv_within(sock, &mut buf, left.min(DRAIN_QUIET)) {
+            Ok(Some(_)) => dropped += 1,
+            Ok(None) => return Ok(dropped),
+            // An earlier send that went unanswered (an ICMP port-unreachable: a reset on Windows, a refusal
+            // elsewhere) says nothing about the stream to come: passed over, after a pause so a stream of them
+            // cannot spin. Any other error ends the stream's start.
+            Err(e)
+                if matches!(e.kind(), std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionRefused) =>
+            {
+                std::thread::sleep(RESET_PAUSE);
+            }
+            Err(e) => return Err(PsnError::Network(format!("the data hole: {e}"))),
+        }
+    }
+}
+
+/// chiaki-ng's stream start over PSN (`session_thread_func` from the switch on): the switch to the stream
+/// connection over ctrl, then the data hole drained, then the stream connection on it, as at home. With the
+/// stream, the ctrl messages that came while it waited for the switch, for the caller to handle.
+///
+/// The console's switch is known by its type alone, as in chiaki-ng: anyone who can send to the control hole
+/// as the console can answer first, and the stream's start then fails when the console does not take it up.
+pub fn open_stream(
+    ctrl: &mut Session,
+    data: Hole,
+    profile: &VideoProfile,
+) -> Result<(Stream, Vec<CtrlEvent>), PsnError> {
+    let events = ctrl.switch_to_stream(SWITCH_TIMEOUT).map_err(PsnError::Lan)?;
+    drain(&data.socket)?;
+    let stream = stream::connect_on(data.socket, ctrl.target(), ctrl.session_id(), ctrl.rpcrypt(), profile)
+        .map_err(PsnError::Lan)?;
+    Ok((stream, events))
 }

@@ -368,6 +368,18 @@ pub fn connect_at(
     let any: IpAddr = if addr.is_ipv4() { std::net::Ipv4Addr::UNSPECIFIED.into() } else { std::net::Ipv6Addr::UNSPECIFIED.into() };
     let socket = UdpSocket::bind((any, 0)).map_err(io)?;
     socket.connect(addr).map_err(io)?;
+    connect_on(socket, target, session_id, rpcrypt, profile)
+}
+
+/// [`connect_at`] on a socket already connected to the console: over PSN, the punched data hole (chiaki-ng
+/// `chiaki_takion_connect` given a socket).
+pub fn connect_on(
+    socket: UdpSocket,
+    target: Target,
+    session_id: &str,
+    rpcrypt: &RpCrypt,
+    profile: &VideoProfile,
+) -> Result<Stream, LanError> {
 
     let mut random = [0u8; 4 + HANDSHAKE_KEY_SIZE];
     getrandom::fill(&mut random).map_err(|e| LanError::Random(e.to_string()))?;

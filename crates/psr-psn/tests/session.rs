@@ -196,3 +196,33 @@ fn a_refused_session_request_is_reported() {
         "{e:?}"
     );
 }
+
+#[test]
+fn the_data_hole_is_drained_until_quiet_or_a_second() {
+    let hole = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let console = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    hole.connect(console.local_addr().unwrap()).unwrap();
+    for _ in 0..3 {
+        console.send_to(&[0x06; 88], hole.local_addr().unwrap()).unwrap();
+    }
+    let begun = Instant::now();
+    assert_eq!(session::drain(&hole).unwrap(), 3);
+    let took = begun.elapsed();
+    // chiaki-ng's: 200 ms with nothing, a second in all.
+    assert_eq!((session::DRAIN_QUIET, session::DRAIN_MAX), (Duration::from_millis(200), Duration::from_secs(1)));
+    assert!(took >= session::DRAIN_QUIET && took < session::DRAIN_QUIET * 3, "{took:?}");
+    // A trickle that never goes quiet is cut off at a second.
+    let to = hole.local_addr().unwrap();
+    let t = thread::spawn(move || {
+        let end = Instant::now() + session::DRAIN_MAX * 2;
+        while Instant::now() < end {
+            console.send_to(&[0x06; 88], to).unwrap();
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
+    let begun = Instant::now();
+    assert!(session::drain(&hole).unwrap() > 5);
+    let took = begun.elapsed();
+    assert!(took >= session::DRAIN_MAX && took < session::DRAIN_MAX + session::DRAIN_QUIET, "{took:?}");
+    t.join().unwrap();
+}

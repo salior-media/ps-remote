@@ -426,3 +426,90 @@ fn what_came_after_the_ctrl_answer_is_read_and_empty_ids_and_heartbeat_floods_ar
     let heartbeats = types.iter().filter(|t| **t == MessageType::HeartbeatRep.code()).count();
     assert_eq!(heartbeats, 1, "{types:x?}");
 }
+
+/// A link with frames to hand out and, optionally, a switch to the stream to send.
+struct Scripted {
+    frames: Vec<Vec<u8>>,
+    switches: bool,
+    switched: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl session::CtrlLink for Scripted {
+    fn write(&mut self, _frames: &[u8]) -> Result<(), LanError> {
+        Ok(())
+    }
+
+    fn read(&mut self, timeout: std::time::Duration) -> Result<Vec<u8>, LanError> {
+        if self.frames.is_empty() || !self.switched.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(timeout.min(std::time::Duration::from_millis(5)));
+            return Ok(Vec::new());
+        }
+        Ok(self.frames.remove(0))
+    }
+
+    fn switch_to_stream(&mut self) -> Result<bool, LanError> {
+        self.switched.store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(self.switches)
+    }
+}
+
+fn scripted_session(
+    switches: bool,
+    after_switch: Vec<Vec<u8>>,
+) -> (session::Session, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use psr_lan::ctrl::{CtrlCipher, CtrlResponse, MessageType};
+    let crypt = psr_crypto::rpcrypt::RpCrypt::auth(Target::Ps5V1, &NONCE, &[0x52; 16]).unwrap();
+    let mut console = CtrlCipher::new(crypt.clone());
+    let id = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789AbCdEfGhIjKlMnOpQrStUvWxYz0123456789Zz";
+    let mut payload = vec![id.len() as u8];
+    payload.extend(id.as_bytes());
+    let rest = console.seal(MessageType::SessionId.code(), &payload);
+    let frames =
+        after_switch.into_iter().map(|ty| console.seal(u16::from_be_bytes([ty[0], ty[1]]), &ty[2..])).collect();
+    let switched = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let link = Scripted { frames, switches, switched: switched.clone() };
+    let s = session::Session::over(
+        Box::new(link),
+        Target::Ps5V1,
+        CtrlCipher::new(crypt),
+        &rest,
+        CtrlResponse { server_type: Some(2), prohibit: false },
+        None,
+    )
+    .unwrap();
+    (s, switched)
+}
+
+#[test]
+fn the_switch_to_the_stream_waits_for_the_consoles_and_returns_the_rest() {
+    use psr_lan::ctrl::MessageType;
+    let code = |t: MessageType| t.code().to_be_bytes().to_vec();
+    let (mut s, switched) = scripted_session(
+        true,
+        vec![[code(MessageType::DisplayDevices), vec![7]].concat(), code(MessageType::SwitchToStreamConnection)],
+    );
+    let others = s.switch_to_stream(std::time::Duration::from_secs(2)).unwrap();
+    assert!(switched.load(std::sync::atomic::Ordering::Relaxed));
+    assert_eq!(others.len(), 1, "{others:?}");
+    // No answer: a timeout, not a hang.
+    let (mut s, _) = scripted_session(true, vec![]);
+    let begun = std::time::Instant::now();
+    assert!(matches!(s.switch_to_stream(std::time::Duration::from_millis(200)), Err(LanError::Timeout(_))));
+    assert!(begun.elapsed() < std::time::Duration::from_secs(1));
+    // At home there is nothing to send, so nothing is waited for.
+    let (mut s, _) = scripted_session(false, vec![]);
+    let begun = std::time::Instant::now();
+    assert!(s.switch_to_stream(std::time::Duration::from_secs(5)).unwrap().is_empty());
+    assert!(begun.elapsed() < std::time::Duration::from_millis(100));
+}
+
+#[test]
+fn what_comes_while_waiting_for_the_switch_is_kept_up_to_a_bound() {
+    use psr_lan::ctrl::MessageType;
+    let code = |t: MessageType| t.code().to_be_bytes().to_vec();
+    let mut frames: Vec<Vec<u8>> = (0..70).map(|i| [code(MessageType::DisplayDevices), vec![i]].concat()).collect();
+    frames.push(code(MessageType::SwitchToStreamConnection));
+    let (mut s, _) = scripted_session(true, frames);
+    let others = s.switch_to_stream(std::time::Duration::from_secs(5)).unwrap();
+    assert_eq!(others.len(), session::SWITCH_EVENTS_MAX);
+}

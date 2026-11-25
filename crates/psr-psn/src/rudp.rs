@@ -370,6 +370,15 @@ pub fn ctrl_message(counter: u16, frames: &[u8]) -> Vec<u8> {
     serialize(&[(CTRL_MESSAGE, &[&counter.to_be_bytes()[..], frames].concat())])
 }
 
+/// The bytes before the random part of chiaki-ng's switch to the stream connection.
+const SWITCH_PREFIX: [u8; 8] = [0x00, 0x00, 0x00, 0x10, 0x00, 0x0D, 0x00, 0x00];
+
+/// chiaki-ng `chiaki_rudp_send_switch_to_stream_connection_message`: a CTRL_MESSAGE carrying our counter, eight
+/// fixed bytes, then 16 random ones.
+pub fn switch_to_stream_message(counter: u16, random: &[u8; 16]) -> Vec<u8> {
+    serialize(&[(CTRL_MESSAGE, &[&counter.to_be_bytes()[..], &SWITCH_PREFIX, random].concat())])
+}
+
 /// chiaki-ng `chiaki_seq_num_16_lt`: `a` comes before `b`, counting round the wrap.
 pub fn seq_lt(a: u16, b: u16) -> bool {
     (1..0x8000).contains(&b.wrapping_sub(a))
@@ -527,12 +536,23 @@ impl Rudp {
         if frames.len() + 2 > MAX_DATA {
             return Err(PsnError::Rudp("the ctrl message is too long for one RUDP message"));
         }
+        self.send_buffered(|counter| ctrl_message(counter, frames))
+    }
+
+    /// chiaki-ng `chiaki_rudp_send_switch_to_stream_connection_message`, kept for resending as ctrl messages are.
+    pub fn send_switch_to_stream(&mut self) -> Result<(), PsnError> {
+        let random = holepunch::random::<16>()?;
+        self.send_buffered(|counter| switch_to_stream_message(counter, &random))
+    }
+
+    /// Sends what `build` makes with the next counter, and keeps it until the console acknowledges it.
+    fn send_buffered(&mut self, build: impl FnOnce(u16) -> Vec<u8>) -> Result<(), PsnError> {
         // Checked before the counter is taken and the message sent, so a refusal leaves nothing half done.
         if self.sent.len() >= SEND_BUFFER_SIZE {
             return Err(PsnError::Rudp("too many ctrl messages wait for the console's acknowledgment"));
         }
         let counter = self.next_counter();
-        let datagram = ctrl_message(counter, frames);
+        let datagram = build(counter);
         self.sock.send(&datagram).map_err(io)?;
         self.sent.push(self.counter, datagram, Instant::now())
     }
@@ -602,6 +622,10 @@ impl Rudp {
 impl CtrlLink for Rudp {
     fn write(&mut self, frames: &[u8]) -> Result<(), LanError> {
         self.send_ctrl(frames).map_err(lan)
+    }
+
+    fn switch_to_stream(&mut self) -> Result<bool, LanError> {
+        self.send_switch_to_stream().map(|()| true).map_err(lan)
     }
 
     fn read(&mut self, timeout: Duration) -> Result<Vec<u8>, LanError> {

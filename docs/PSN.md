@@ -275,6 +275,33 @@ steps of chiaki-ng's 200 ms resend wake-up, rather than by a thread.
   PSN the hole's address is the only thing in the way; at home TCP's sequence numbers made that harder. The
   session request also carries the registration key in the clear, as at home.
 
+**9c-3a, the stream over the data hole.** chiaki-ng's last steps before the stream over PSN, ported in
+`crates/psr-psn/src/session.rs` `open_stream`: ctrl sends RUDP's switch to the stream connection (a CTRL_MESSAGE
+of our counter, eight fixed bytes and 16 random ones, resent until acknowledged like any ctrl message) and waits
+up to 5 s for the console's `SwitchToStreamConnection`; then what the holepunch left on the data hole is read
+and dropped, until 200 ms pass with none or a second in all (`takion_read_extra_sock_messages`); then the home
+network's stream connection runs on the data hole's socket (`psr_lan::stream::connect_on`), Takion, keys and
+all, unchanged. Not ported: chiaki-ng also sets the socket's receive buffer to Takion's window, which the home
+path does not do either.
+
+**9c-3a against the household's PS5 (2026-11-25), on the LAN:** the stream connected 1.6 s after the data hole,
+with one resolution offered, and ran 15 s: 890 video frames (59.3 a second, of the 60 asked for), 1,497 audio
+frames, no frame lost and no datagram dropped, with ctrl polled every 100 ms as the app does. The console was on
+its home screen, so the video was small (174 KiB). Nothing was decoded or shown: that is the app's part, 9c-3b.
+
+**What the security review of 9c-3a changed** (7 findings, none critical or high, reasoned from the code):
+- The drain passes over "connection refused" as it does Windows' reset (both are an earlier send unanswered),
+  pausing 1 ms each, where a refusal used to end the stream's start on Linux and macOS and a run of resets spun.
+- The ctrl messages that come while waiting for the switch are returned to the caller, at most 64, where they
+  were dropped; and the unasked heartbeat reply goes out during that wait too.
+- **Left as chiaki-ng has it (MEDIUM, DoS only):** the console's switch is known by its type, and an empty frame
+  uses no cipher counter, so someone who can send to the control hole as the console can answer the switch
+  first. The stream's start then fails when the console does not take it up (about 15 s); nothing is learned or
+  taken over, as Takion's own handshake and keys are unchanged. A datagram arriving on the data hole after the
+  drain goes quiet can likewise end the stream's handshake, as it could at home.
+- Deliberate breaks: 8 on 9c-3a, 6 caught; the drain's two timings got a test pinning chiaki-ng's values; the
+  drain inside `open_stream` is checked only by the live run. The new bound was broken and caught.
+
 **Found while verifying 9c-2, and fixed: on Windows an answer that arrives as a receive times out can be lost.**
 1. The punch test `only_a_request_makes_a_derived_candidate` failed 9 runs in 20. Its stand-in console answers
    1.5 s after our first request, as one of our 500 ms waits ends, and on failing runs the answer never came out
