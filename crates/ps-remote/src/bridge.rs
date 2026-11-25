@@ -7,7 +7,6 @@ use std::io::ErrorKind;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::time::Instant;
 
-use psr_input::controller::ControllerState;
 use str0m::change::{SdpAnswer, SdpOffer};
 use str0m::channel::ChannelId;
 use str0m::format::{Codec, PayloadParams};
@@ -38,8 +37,8 @@ pub enum BridgeError {
 pub enum BridgeEvent {
     /// The browser's media is connected.
     Connected,
-    /// A new controller state from the input channel.
-    Input(ControllerState),
+    /// A new controller state from the input channel, with the fingers on the touchpad.
+    Input(input::Input),
     /// The browser lost its picture (a PLI or FIR): ask the console for a keyframe.
     KeyframeRequested,
     /// An input message that failed its checks, dropped.
@@ -221,7 +220,8 @@ impl Bridge {
             }
             Event::KeyframeRequest(_) => events.push(BridgeEvent::KeyframeRequested),
             Event::ChannelOpen(id, label) if label == INPUT_CHANNEL => self.input_channel = Some(id),
-            Event::ChannelData(d) if Some(d.id) == self.input_channel && !d.binary => match input::parse(&d.data) {
+            Event::ChannelData(d) if Some(d.id) == self.input_channel && !d.binary => match input::parse_input(&d.data)
+            {
                 Some(state) => events.push(BridgeEvent::Input(state)),
                 None => events.push(BridgeEvent::BadInput),
             },

@@ -8,7 +8,7 @@
 <style>
   :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
   body { margin: 0; padding: 16px; display: grid; gap: 12px; max-width: 1280px; }
-  video { width: 100%; aspect-ratio: 16 / 9; background: #000; border-radius: 6px; }
+  video { width: 100%; aspect-ratio: 16 / 9; background: #000; border-radius: 6px; touch-action: none; }
   .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
   #status { font-family: ui-monospace, monospace; font-size: 13px; opacity: 0.8; }
 </style>
@@ -24,7 +24,7 @@
 <video id="video" autoplay playsinline muted></video>
 <div class="row">
   <button id="sound">Sound on</button>
-  <span>Input: a gamepad, or the arrow keys, Enter (cross) and Backspace (circle) while this page has focus.</span>
+  <span>Input: a gamepad, or the arrow keys, Enter (cross) and Backspace (circle) while this page has focus. The picture is the touchpad: press and drag on it (two fingers on a touchscreen).</span>
 </div>
 <div id="status">Not playing.</div>
 <script>
@@ -76,7 +76,37 @@ function readInput() {
     r2 = Math.max(r2, Math.round((pad.buttons[7]?.value || 0) * 255));
     [lx, ly, rx, ry] = pad.axes.slice(0, 4).map(stick);
   }
-  return { buttons, l2, r2, lx, ly, rx, ry };
+  // Positions to four places: plenty for the touchpad's 1920 steps, and the message stays small.
+  const touches = [...fingers.values()].map((f) => ({ id: f.id, x: +f.x.toFixed(4), y: +f.y.toFixed(4) }));
+  return { buttons, l2, r2, lx, ly, rx, ry, touches };
+}
+
+// The picture is the touchpad, as chiaki-ng makes its stream window: a pointer pressed on it is a finger, up to
+// the touchpad's two. Each gets the lowest small id free while it is down.
+const fingers = new Map();
+function at(e) {
+  const r = $("video").getBoundingClientRect();
+  const clamp = (v) => Math.min(1, Math.max(0, v));
+  return { x: clamp((e.clientX - r.left) / r.width), y: clamp((e.clientY - r.top) / r.height) };
+}
+$("video").addEventListener("pointerdown", (e) => {
+  if (fingers.size >= 2) return;
+  const used = new Set([...fingers.values()].map((f) => f.id));
+  let id = 0;
+  while (used.has(id)) id++;
+  fingers.set(e.pointerId, { id, ...at(e) });
+  $("video").setPointerCapture(e.pointerId);
+  e.preventDefault();
+  flushInput();
+});
+$("video").addEventListener("pointermove", (e) => {
+  const f = fingers.get(e.pointerId);
+  if (!f) return;
+  Object.assign(f, at(e));
+  flushInput();
+});
+for (const end of ["pointerup", "pointercancel"]) {
+  $("video").addEventListener(end, (e) => { if (fingers.delete(e.pointerId)) flushInput(); });
 }
 
 function flushInput() {
