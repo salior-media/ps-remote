@@ -111,6 +111,12 @@ pub fn save_refresh_token(config_dir: &Path, token: &str) -> Result<(), PsnError
     psr_lan::store::write_private(&path(config_dir), &seal(token.as_bytes())?).map_err(PsnError::Io)
 }
 
+/// Whether a sign-in is saved: the file is there. It is not opened, so a sign-in that no longer opens (another
+/// Windows user's, say) still shows as saved, and can be replaced or forgotten.
+pub fn is_saved(config_dir: &Path) -> bool {
+    path(config_dir).is_file()
+}
+
 /// The saved refresh token, or `None` when nobody has signed in.
 pub fn load_refresh_token(config_dir: &Path) -> Result<Option<String>, PsnError> {
     let sealed = match std::fs::read(path(config_dir)) {
@@ -125,9 +131,16 @@ pub fn load_refresh_token(config_dir: &Path) -> Result<Option<String>, PsnError>
 /// Forgets the sign-in on this machine. It does not revoke it at Sony: that is done in the PSN account's
 /// own settings.
 pub fn forget(config_dir: &Path) -> Result<(), PsnError> {
-    match std::fs::remove_file(path(config_dir)) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(PsnError::Io(e)),
+    let file = path(config_dir);
+    // A save cut short leaves its sealed temporary file (`psr_lan::store::write_private`); it goes too.
+    let mut tmp = file.clone().into_os_string();
+    tmp.push(".tmp");
+    for f in [file, PathBuf::from(tmp)] {
+        match std::fs::remove_file(&f) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(PsnError::Io(e)),
+        }
     }
+    Ok(())
 }

@@ -289,6 +289,32 @@ async fn without_the_app_secret_psn_sign_in_says_it_is_off() {
     assert_eq!(get(&s, "/api/psn-signin-url").await.0, 503);
     let redirect = r#"{"redirect":"https://remoteplay.dl.playstation.net/remoteplay/redirect?code=abc"}"#;
     assert_eq!(post(&s, "/api/psn-signin", redirect).await.0, 503);
+    assert_eq!(post(&s, "/api/psn-signout", "").await.0, 503, "it cannot claim to have forgotten anything");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sign_in_routes_answer_only_their_own_host() {
+    let s = server_psn().await;
+    for (method, path) in [
+        ("GET", "/api/psn-status"),
+        ("GET", "/api/psn-signin-url"),
+        ("POST", "/api/psn-signin"),
+        ("POST", "/api/psn-signout"),
+    ] {
+        let (code, _) = request(s.port, method, path, "evil.example", Some(&s.token), "{}").await;
+        assert_eq!(code, 421, "{method} {path}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_saved_sign_in_that_does_not_open_can_still_be_forgotten() {
+    let s = server_psn().await;
+    std::fs::write(s.dir.0.join(psr_psn::secret::REFRESH_TOKEN_FILE), b"not a sealed token").unwrap();
+    std::fs::write(s.dir.0.join(format!("{}.tmp", psr_psn::secret::REFRESH_TOKEN_FILE)), b"left over").unwrap();
+    assert_eq!(get(&s, "/api/psn-status").await, (200, r#"{"available":true,"signed_in":true}"#.into()));
+    assert_eq!(post(&s, "/api/psn-signout", "").await.0, 204);
+    assert_eq!(get(&s, "/api/psn-status").await.1, r#"{"available":true,"signed_in":false}"#);
+    assert!(!s.dir.0.join(format!("{}.tmp", psr_psn::secret::REFRESH_TOKEN_FILE)).exists(), "the leftover went too");
 }
 
 #[tokio::test(flavor = "multi_thread")]

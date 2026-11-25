@@ -464,24 +464,17 @@ async fn play(State(s): State<Arc<Service>>, axum::Json(req): axum::Json<PlayReq
 
 const PSN_OFF: &str = "playing over PSN needs PSN_RP_CLIENT_SECRET set when the service starts";
 
-/// Whether playing over PSN is on, and whether a sign-in is saved (`docs/SERVICE.md`, step 8d). The saved
-/// sign-in is opened to see that it is there and readable; it is not sent anywhere.
+/// Whether playing over PSN is on, and whether a sign-in is saved (`docs/SERVICE.md`, step 8d). Only the file's
+/// presence is looked at: the sign-in is not opened, so one that no longer opens can still be replaced or forgotten.
 async fn psn_status(State(s): State<Arc<Service>>) -> Response {
-    let signed_in = match s.psn.as_ref() {
-        None => false,
-        Some(psn) => {
-            let dir = psn.config_dir.clone();
-            let saved = tokio::task::spawn_blocking(move || psr_psn::secret::load_refresh_token(&dir)).await;
-            match saved {
-                Ok(Ok(found)) => found.is_some(),
-                Ok(Err(e)) => {
-                    return refuse_owned(StatusCode::INTERNAL_SERVER_ERROR, format!("the saved sign-in: {e}"));
-                }
-                Err(_) => return refuse(StatusCode::INTERNAL_SERVER_ERROR, "reading the saved sign-in failed"),
-            }
-        }
-    };
+    let signed_in = s.psn.as_ref().is_some_and(|psn| psr_psn::secret::is_saved(&psn.config_dir));
     axum::Json(serde_json::json!({ "available": s.psn.is_some(), "signed_in": signed_in })).into_response()
+}
+
+/// A running session keeps its own tokens, and may save a renewed refresh token when it ends
+/// (`psr_psn::play::Leave`). Signing in or out under it could be undone by that save, so both wait for it to end.
+fn session_running(s: &Service) -> bool {
+    s.session().as_ref().is_some_and(Handle::is_running)
 }
 
 /// Sony's sign-in page, with a new client device ID, as `ps-remote signin` prints it.
@@ -525,6 +518,9 @@ async fn psn_signin(State(s): State<Arc<Service>>, body: Result<axum::Json<Signi
     let Some(starting) = Starting::take(&s) else {
         return refuse(StatusCode::CONFLICT, "a session is starting");
     };
+    if session_running(&s) {
+        return refuse(StatusCode::CONFLICT, "stop the session first: it would keep its own sign-in");
+    }
     let (secret, dir) = (psn.app_secret.clone(), psn.config_dir.clone());
     let done = tokio::task::spawn_blocking(move || {
         let _starting = starting;
@@ -541,12 +537,16 @@ async fn psn_signin(State(s): State<Arc<Service>>, body: Result<axum::Json<Signi
 
 /// Forgets the saved sign-in here, as `ps-remote signout` does. It stays valid at Sony until it expires.
 async fn psn_signout(State(s): State<Arc<Service>>) -> Response {
+    // Without the app secret the saved sign-in's folder is not known here; saying 204 would claim it was forgotten.
     let Some(psn) = s.psn.as_ref() else {
-        return StatusCode::NO_CONTENT.into_response();
+        return refuse(StatusCode::SERVICE_UNAVAILABLE, PSN_OFF);
     };
     let Some(starting) = Starting::take(&s) else {
         return refuse(StatusCode::CONFLICT, "a session is starting");
     };
+    if session_running(&s) {
+        return refuse(StatusCode::CONFLICT, "stop the session first: it would keep its own sign-in");
+    }
     let dir = psn.config_dir.clone();
     let done = tokio::task::spawn_blocking(move || {
         let _starting = starting;
