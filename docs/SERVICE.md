@@ -82,6 +82,18 @@ game-play forwards both, and its PlayStation tab gets *Link a console* (address 
 not answer as a console, no account ID without PSN), and live, the household PS5 wakes from rest mode from the tab.
 Linking live needs the console's *Link Device* screen open; it re-links the same console, which replaces its saved keys.
 
+**Review, 2026-11-26:** a security review found no critical or high issues. Its two mediums are fixed (linking
+saves only the console that answered; the wake docs no longer claim more than an unauthenticated check gives), and
+so are three lows: private addresses only, no echo of a malformed body, and the state said when nothing is sent.
+Left as they are: a save can fail if `/api/consoles` holds the file open at that moment (the reply says the keys
+were not saved), the consoles folder fails closed on a bad file, and nothing on this side limits PIN attempts (the
+console does). No test has a fake console answering registration, so linking's success path is tested live only.
+
+**Live, 2026-11-26, through game-play:** the household PS5 was in rest mode; `/api/wake` answered `{"sent": true}`
+and the console answered discovery as ready about 10 to 12 s later (done twice). Waking it while awake answered
+`{"sent": false, "state": "Ready"}`. A wake to another address, to an internet address, and a link with a malformed
+PIN were refused. Linking itself was not run live: it needs the *Link Device* screen open.
+
 ## Why each choice
 
 - **Loopback only, with a token:** the API can start a session with the household's console, so nothing but this
