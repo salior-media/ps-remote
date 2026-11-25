@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 base64 = "=0.23.1"
 getrandom = "=0.4.3"
+psr-crypto = { path = "../psr-crypto" }
 psr-lan = { path = "../psr-lan" }
 # The same rustls ureq uses, for the push websocket's TLS (see push.rs).
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }

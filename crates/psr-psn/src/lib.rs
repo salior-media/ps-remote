@@ -8,7 +8,9 @@ pub mod devices;
 pub mod holepunch;
 pub mod punch;
 pub mod push;
+pub mod regist;
 pub mod rps;
+pub mod rudp;
 pub mod secret;
 pub mod stun;
 
@@ -36,6 +38,12 @@ pub enum PsnError {
     Terminated,
     #[error("the configuration folder: {0}")]
     Io(std::io::Error),
+    /// The console's RUDP answer was not what the exchange needs.
+    #[error("RUDP: {0}")]
+    Rudp(&'static str),
+    /// What the console said once the exchange reached it: a refused registration, a malformed answer.
+    #[error(transparent)]
+    Lan(psr_lan::LanError),
 }
 
 /// Longest error message kept from a refusal.

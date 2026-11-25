@@ -19,7 +19,8 @@ use crate::session::reason_text;
 pub enum LanError {
     #[error("not an HTTP/1.1 response")]
     NotHttp,
-    #[error("malformed header line: {0:?}")]
+    /// Names what was malformed, never the value: see [`http::name_only`].
+    #[error("malformed header: {0}")]
     BadHeader(String),
     #[error("network: {0}")]
     Io(std::io::Error),
@@ -39,6 +40,8 @@ pub enum LanError {
     NeedsAccountId(Target),
     #[error("no RP-Version for {0:?}")]
     NoRpVersion(Target),
+    #[error("{0:?} cannot register over PSN; it registers at home with a PIN")]
+    NoPsnRegist(Target),
     #[error("the system random number generator failed: {0}")]
     Random(String),
     #[error("saved console file is invalid: {0}")]

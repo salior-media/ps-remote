@@ -370,6 +370,8 @@ pub struct Hole {
     pub candidate: Candidate,
     /// See [`Found::ids_mirrored`].
     pub ids_mirrored: bool,
+    /// Our local address, the one our LOCAL candidate offered; registration sends it as `HOST`.
+    pub local_ip: Ipv4Addr,
 }
 
 impl std::fmt::Debug for Found {
@@ -504,7 +506,7 @@ impl<'a> Puncher<'a> {
         // chiaki-ng answers the console's requests once more after the accepts; none coming is fine then.
         answer_requests(&sock, &self.ours, &console, found.addr)?;
         self.ctrl_done = true;
-        Ok(Hole { socket: sock, console: found.addr, candidate: selected, ids_mirrored: found.ids_mirrored })
+        Ok(Hole { socket: sock, console: found.addr, candidate: selected, ids_mirrored: found.ids_mirrored, local_ip })
     }
 }
 

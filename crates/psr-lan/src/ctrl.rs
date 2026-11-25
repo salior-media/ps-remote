@@ -182,7 +182,7 @@ pub fn parse_ctrl_response(head: &[u8], cipher: &mut CtrlCipher) -> Result<CtrlR
     }
     let server_type = match response.header("RP-Server-Type") {
         Some(v) => {
-            let raw = base64::engine::general_purpose::STANDARD.decode(v.trim()).map_err(|_| LanError::BadHeader(v.into()))?;
+            let raw = base64::engine::general_purpose::STANDARD.decode(v.trim()).map_err(|_| LanError::BadHeader(http::name_only("RP-Server-Type")))?;
             (raw.len() == 16).then(|| cipher.open(&raw)[0])
         }
         None => None,
