@@ -287,10 +287,10 @@ pub fn check_candidates(
             next_resend += SELECT_TIMEOUT;
         }
         let wait = next_resend.min(deadline).saturating_duration_since(now).max(Duration::from_millis(1));
-        sock.set_read_timeout(Some(wait)).map_err(io)?;
-        let (n, from) = match sock.recv_from(&mut buf) {
-            Ok((n, SocketAddr::V4(from))) => (n, from),
-            Ok(_) => continue,
+        let (n, from) = match psr_lan::udp::recv_from_within(sock, &mut buf, wait) {
+            Ok(None) => continue,
+            Ok(Some((n, SocketAddr::V4(from)))) => (n, from),
+            Ok(Some(_)) => continue,
             Err(e) if stun::is_transient(&e) => continue,
             Err(e) => return Err(io(e)),
         };
@@ -344,9 +344,9 @@ pub fn answer_requests(sock: &UdpSocket, ours: &Ids, console: &Ids, to: SocketAd
         if now >= until {
             break;
         }
-        sock.set_read_timeout(Some((until - now).max(Duration::from_millis(1)))).map_err(io)?;
-        let n = match sock.recv(&mut buf) {
-            Ok(n) => n,
+        let n = match psr_lan::udp::recv_within(sock, &mut buf, until - now) {
+            Ok(None) => continue,
+            Ok(Some(n)) => n,
             Err(e) if stun::is_transient(&e) => continue,
             Err(e) => return Err(io(e)),
         };

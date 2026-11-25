@@ -304,9 +304,9 @@ impl Rudp {
                 if now >= deadline {
                     break;
                 }
-                self.sock.set_read_timeout(Some((deadline - now).max(Duration::from_millis(1)))).map_err(io)?;
-                let n = match self.sock.recv(&mut buf) {
-                    Ok(n) => n,
+                let n = match psr_lan::udp::recv_within(&self.sock, &mut buf, deadline - now) {
+                    Ok(None) => continue,
+                    Ok(Some(n)) => n,
                     Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
                         std::thread::sleep(RESET_PAUSE);
                         continue;
@@ -561,9 +561,9 @@ impl Rudp {
                 return Ok(Vec::new());
             }
             let wait = (deadline - now).min(RESEND_WAKE).max(Duration::from_millis(1));
-            self.sock.set_read_timeout(Some(wait)).map_err(io)?;
-            let n = match self.sock.recv(&mut buf) {
-                Ok(n) => n,
+            let n = match psr_lan::udp::recv_within(&self.sock, &mut buf, wait) {
+                Ok(None) => continue,
+                Ok(Some(n)) => n,
                 Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
                     std::thread::sleep(RESET_PAUSE);
                     continue;

@@ -170,9 +170,9 @@ pub fn search(broadcast: Ipv4Addr, wait: Duration) -> Result<Vec<Host>, LanError
     let mut hosts: Vec<Host> = Vec::new();
     let mut buf = [0u8; 512];
     while let Some(left) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) {
-        socket.set_read_timeout(Some(left)).map_err(LanError::Io)?;
-        match socket.recv_from(&mut buf) {
-            Ok((n, from)) => {
+        match crate::udp::recv_from_within(&socket, &mut buf, left) {
+            Ok(None) => break,
+            Ok(Some((n, from))) => {
                 if let Ok(host) = Host::parse(from.ip(), &buf[..n])
                     && !hosts.iter().any(|h| h.addr == host.addr)
                 {
