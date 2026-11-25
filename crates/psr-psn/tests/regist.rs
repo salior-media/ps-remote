@@ -83,14 +83,32 @@ fn recv(console: &UdpSocket) -> (Vec<Message>, SocketAddr) {
     (rudp::parse(&buf[..n]), from)
 }
 
+/// The next datagram holding a message of `kind`. The client resends a request it has had no answer to, so a
+/// console that answers late also gets the earlier request again; like a real one, the stand-in passes over those.
+fn recv_kind(console: &UdpSocket, kind: u16) -> (Vec<Message>, SocketAddr) {
+    loop {
+        let (m, from) = recv(console);
+        if m.iter().any(|x| x.kind == kind) {
+            return (m, from);
+        }
+    }
+}
+
 /// The stand-in console: the RUDP handshake, then the registration answered with `status`.
 fn console(sock: UdpSocket, status: &'static str, finish: bool) -> thread::JoinHandle<()> {
+    console_after(sock, status, finish, Duration::ZERO)
+}
+
+/// The stand-in console, waiting `delay` before each answer, as one on a loaded machine (or far away) does.
+fn console_after(sock: UdpSocket, status: &'static str, finish: bool, delay: Duration) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let (_, client) = recv(&sock);
+        let (_, client) = recv_kind(&sock, rudp::INIT_REQUEST);
+        thread::sleep(delay);
         sock.send_to(&rudp::serialize(&[(rudp::INIT_RESPONSE, &[0; 12])]), client).unwrap();
-        recv(&sock);
+        recv_kind(&sock, rudp::COOKIE_REQUEST);
+        thread::sleep(delay);
         sock.send_to(&rudp::serialize(&[(rudp::COOKIE_RESPONSE, &[0x00, 0x07])]), client).unwrap();
-        let (m, _) = recv(&sock);
+        let (m, _) = recv_kind(&sock, rudp::SESSION_MESSAGE);
         let (_, payload) = split(&m[1].data[2..]);
         let (crypt, inner) = console_reads(Target::Ps5V1, payload, &started());
         assert!(inner.contains("Np-AccountId: AQIDBAUGBwg="));
@@ -99,7 +117,7 @@ fn console(sock: UdpSocket, status: &'static str, finish: bool) -> thread::JoinH
         answer.extend(format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes());
         answer.extend(body);
         sock.send_to(&rudp::serialize(&[(rudp::CTRL_MESSAGE, &answer)]), client).unwrap();
-        let (a, _) = recv(&sock);
+        let (a, _) = recv_kind(&sock, rudp::ACK);
         assert_eq!(a[0].kind, rudp::ACK);
         if finish {
             sock.send_to(&rudp::serialize(&[(rudp::FINISH, &[])]), client).unwrap();
@@ -170,4 +188,17 @@ fn a_malformed_answer_names_no_key_in_its_error() {
     // A length that would overflow is a short answer, not a crash.
     let e = psr_lan::regist::parse_response(target, &crypt, &answer(b"x", Some("18446744073709551615"))).unwrap_err();
     assert!(matches!(e, LanError::Truncated), "{e:?}");
+}
+
+/// A console slower to answer than the client's resend (`rudp::EXPECT_TIMEOUT`) gets the resent request as well
+/// as the next one, as a real one far away can, and as the stand-in did once under a loaded test run (2026-11-26).
+#[test]
+fn a_console_slower_than_the_resend_still_registers_us() {
+    let (client, sock) = pair();
+    let t = console_after(sock, "200 OK", true, rudp::EXPECT_TIMEOUT + Duration::from_millis(200));
+    let mut r = Rudp::new(client).unwrap();
+    let done = regist::register(&mut r, Target::Ps5V1, ACCOUNT_ID, &started(), LOCAL).unwrap();
+    t.join().unwrap();
+    assert!(done.finished);
+    assert_eq!(done.host.server_mac, [0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6]);
 }
