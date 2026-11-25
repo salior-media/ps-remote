@@ -329,6 +329,19 @@ its home screen, so the video was small (174 KiB). Nothing was decoded or shown:
 
 **Not verified yet:** any of it from another network; the data hole's use (the stream over it is 9c-3).
 
+**9c-3b, play over PSN from the app.** `crates/psr-psn/src/play.rs` `connect` runs the whole of step 9 in one
+call, from the saved sign-in to the stream, and keeps Sony's push websocket read and Sony's session joined, on a
+thread of its own, for as long as the stream plays; the session is left when it ends, or at once if the start
+fails. The service (`ps-remote serve`) offers it as `POST /api/play-psn` when `PSN_RP_CLIENT_SECRET` is set
+when it starts, and the test page has a **Play over PSN** button; the session then runs in the same loop as a
+home session (`runner.rs`), the browser's media going to our address on the network the holes left by.
+
+**9c-3b against the household's PS5 (2026-11-25), on the LAN, through the service's API:** `play-psn` answered
+204 after 31 s; the status then counted 168, 350 and 531 video frames at 3 s intervals (about 60 a second) and
+audio at about 100 a second, none lost; `stop` ended it. Not checked there: the browser's picture and sound
+(the test page needs a browser, which the owner drives), and that Sony's session was left at the end (nothing
+shows it from this side).
+
 ## What 9a does not do yet
 
 9a doesn't wake a console over PSN, run the holepunch session, or carry any media. 9b-1 adds the session's control

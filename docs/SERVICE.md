@@ -40,6 +40,7 @@ takes it off the address bar once read. The page itself holds no token, because 
 | `GET /` | the test page: a video element, and a gamepad sent as input |
 | `GET /api/consoles` | the linked consoles (the saved registrations), without keys |
 | `POST /api/play` | `{"host": "<console IPv4>"}` starts a session with the linked console there, once that address answers discovery as that console. One session, and one start, at a time |
+| `POST /api/play-psn` | No body. Plays the PSN account's first console with Remote Play on, from away, through Sony's servers and two punched holes (`docs/PSN.md`, 9c-3b); around 30 to 40 s. Needs `PSN_RP_CLIENT_SECRET` in the service's environment when it starts (kept in memory only) and a saved sign-in (`ps-remote signin`); otherwise 503. Same one-at-a-time rules as `/api/play`; the browser then connects with `/api/offer` as for a home session |
 | `POST /api/offer` | the browser's SDP offer, answered with the service's SDP answer |
 | `POST /api/stop` | ends the session |
 | `GET /api/status` | whether a session runs, and its frame, loss and drop counts |
