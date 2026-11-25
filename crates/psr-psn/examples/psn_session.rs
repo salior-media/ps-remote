@@ -18,8 +18,8 @@ use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use psr_lan::ctrl::CtrlEvent;
 use psr_av::video::VideoEvent;
+use psr_lan::ctrl::CtrlEvent;
 use psr_lan::session::{Codec, Session};
 use psr_lan::stream::{StreamEvent, VideoProfile};
 
@@ -116,7 +116,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             let mut stream = psn_session::open_stream(&mut ctrl, data, &VideoProfile::p720_60(Codec::H264))?;
-            println!("{}  stream connected on the data hole: {} resolutions offered", t(), stream.info().resolutions.len());
+            println!(
+                "{}  stream connected on the data hole: {} resolutions offered",
+                t(),
+                stream.info().resolutions.len()
+            );
             let (mut headers, mut frames, mut bytes, mut audio, mut lost_reports, mut other) = (0, 0, 0usize, 0, 0, 0);
             let mut ended = None;
             let begun = Instant::now();

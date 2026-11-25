@@ -473,3 +473,24 @@ fn a_console_that_never_acknowledges_is_reported() {
     assert!(matches!(got, Err(PsnError::Rudp(_))), "{got:?} after {:?}", begun.elapsed());
     assert!(begun.elapsed() >= rudp::RESEND_TIMEOUT * rudp::RESEND_TRIES_MAX, "{:?}", begun.elapsed());
 }
+
+#[test]
+fn the_switch_to_the_stream_is_chiaki_ngs_bytes_and_resent_until_acknowledged() {
+    let m = rudp::switch_to_stream_message(COUNTER, &[0xAB; 16]);
+    assert_eq!(&m[..8], &[0xC0, 0x22, 0x24, 0x4F, 0x24, 0x4F, 0x02, 0x30], "CTRL_MESSAGE, 8 + 26 bytes");
+    assert_eq!(&m[8..18], &[0x12, 0x34, 0x00, 0x00, 0x00, 0x10, 0x00, 0x0D, 0x00, 0x00]);
+    assert_eq!(&m[18..], &[0xAB; 16]);
+    let (client, console) = pair();
+    let mut r = Rudp::with(client, COUNTER, HEADER);
+    r.send_switch_to_stream().unwrap();
+    let (first, from) = recv(&console);
+    assert_eq!(&first[0].data[..10], &m[8..18]);
+    assert_eq!(r.unacknowledged(), 1);
+    assert!(r.read_ctrl(rudp::RESEND_TIMEOUT + rudp::RESEND_WAKE * 2).unwrap().is_empty());
+    let (again, _) = recv(&console);
+    assert_eq!(again, first, "resent as it was, random part included");
+    let ack = rudp::serialize(&[(rudp::ACK, &[&[0, 1][..], &(COUNTER + 1).to_be_bytes(), &[0, 0x92]].concat())]);
+    console.send_to(&ack, from).unwrap();
+    assert!(r.read_ctrl(Duration::from_millis(150)).unwrap().is_empty());
+    assert_eq!(r.unacknowledged(), 0);
+}
