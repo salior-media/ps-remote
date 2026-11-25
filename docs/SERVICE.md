@@ -46,6 +46,10 @@ takes it off the address bar once read. The page itself holds no token, because 
 | `POST /api/play-psn` | No body. Plays the PSN account's first console with Remote Play on, from away, through Sony's servers and two punched holes (`docs/PSN.md`, 9c-3b); around 30 to 40 s. Needs `PSN_RP_CLIENT_SECRET` in the service's environment when it starts (kept in memory only) and a saved sign-in (`ps-remote signin`); otherwise 503. Same one-at-a-time rules as `/api/play`; the browser then connects with `/api/offer` as for a home session |
 | `POST /api/link` | `{"host": "<console IPv4>", "pin": "<8 digits>"}`, with `"account_id"` (base64, as the `psn_account_id` example prints it) unless the service has PSN on and a saved sign-in, in which case it asks Sony. Links with the console that answers discovery there, with the PIN from its *Link Device* screen, and saves its keys as the `link` example does. Answers the console's nickname and MAC, never its keys. Takes the start slot (409 while a start runs) |
 | `POST /api/wake` | `{"host": "<console IPv4>"}` (and `"console"` when several are linked) wakes the linked console there from rest mode, once that address answers discovery as that console (a private address only). Answers `{"sent": true}` when it sent one, and `{"sent": false, "state": …}` when the console was not in rest mode |
+| `GET /api/psn-status` | `{"available", "signed_in"}`: whether playing over PSN is on (the app secret was set when the service started) and whether a PSN sign-in is saved. It reads only whether the saved sign-in is there and opens, and never sends it anywhere |
+| `GET /api/psn-signin-url` | `{"url"}`: Sony's sign-in page for the Remote Play app, with a new client device ID, as `ps-remote signin` prints it. 503 without the app secret |
+| `POST /api/psn-signin` | `{"redirect": "<the address of Sony's redirect page>"}` trades the one-time code in it for tokens and saves the refresh token, as `ps-remote signin` does. Only Sony's redirect page is accepted, the address is never echoed, and nothing is answered but 204 or the reason. Takes the start slot (409 while a start runs) |
+| `POST /api/psn-signout` | forgets the saved sign-in on this machine, as `ps-remote signout` does (it stays valid at Sony until it expires) |
 | `POST /api/offer` | the browser's SDP offer, answered with the service's SDP answer |
 | `POST /api/stop` | ends the session |
 | `GET /api/status` | whether a session runs, its frame, loss and drop counts, and `bitrate_kbps`: the video and audio received over the last second. The console-to-service delay is not reported: chiaki-ng's way to measure it (Senkusha) is compiled there but never switched on, as no build defines `ENABLE_SENKUSHA`. The test page shows the browser's share instead, from WebRTC's own counters: the browser-to-service round trip, and per frame the time buffered, decoding, and from received to shown |
@@ -93,6 +97,29 @@ console does). No test has a fake console answering registration, so linking's s
 and the console answered discovery as ready about 10 to 12 s later (done twice). Waking it while awake answered
 `{"sent": false, "state": "Ready"}`. A wake to another address, to an internet address, and a link with a malformed
 PIN were refused. Linking itself was not run live: it needs the *Link Device* screen open.
+
+## PSN sign-in through the API (step 8d)
+
+> Owner, 2026-11-26, after linking and waking merged: *"lleets conuine then"*. PSN sign-in from the tab was next on
+> the list of what is left.
+
+Signing in was `ps-remote signin` in a terminal. Four routes put it behind the API, built from the same parts
+(`psr_psn::auth::login_url`, `code_from_redirect`, `exchange_code`, `psr_psn::secret`):
+
+- The person still signs in **on Sony's own page**, in their own browser; ps-remote never sees the password. Sony
+  then shows its redirect page, whose address carries a one-time code, and the person pastes that address back.
+  There is no way round the paste: Sony sends the Remote Play app's sign-in only to its own redirect page.
+- The pasted address is checked to be exactly that page before its code is read, and is never echoed back or kept.
+  Only the refresh token is saved, as before (encrypted with DPAPI on Windows); no token is ever answered.
+- Signing in takes the start slot, so it cannot race a PSN start or console list over which refresh token is
+  current.
+
+game-play forwards all four, and its PlayStation tab shows a *Sign in to PSN* box when playing over PSN is on and no
+sign-in is saved, with *Sign out* once one is.
+
+**Done when:** the routes' checks are tested (token, Host, 503 without the app secret, an address that is not Sony's
+redirect page refused without being echoed, no code, the status before and after a saved sign-in, sign-out), and
+live, the owner signs in from the tab and the PSN console list answers.
 
 ## Why each choice
 
