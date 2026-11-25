@@ -166,7 +166,7 @@ async function showStatus() {
   try {
     const s = await (await api("/status")).json();
     $("status").textContent = s.running
-      ? `Playing. Browser ${s.browser_connected ? "connected" : "connecting"}. ${s.frames} frames (${s.frames_lost} lost), ${s.audio_frames} audio frames, ${s.bad_input} bad input messages.`
+      ? `Playing. Browser ${s.browser_connected ? "connected" : "connecting"}. ${s.frames} frames (${s.frames_lost} lost), ${s.audio_frames} audio frames, ${(s.bitrate_kbps / 1000).toFixed(1)} Mbit/s, ${s.bad_input} bad input messages.`
       : (s.ended ? "Ended: " + s.ended : "Not playing.");
   } catch (e) { $("status").textContent = String(e); }
 }
