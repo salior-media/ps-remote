@@ -178,6 +178,28 @@ impl Drop for Keeper {
     }
 }
 
+/// The access token from the saved sign-in in `config_dir`, keeping the refresh token Sony hands back.
+fn sign_in(app_secret: &str, config_dir: &Path) -> Result<auth::Tokens, PsnError> {
+    let refresh = secret::load_refresh_token(config_dir)?
+        .ok_or(PsnError::MissingField("a saved PSN sign-in (run `ps-remote signin`)"))?;
+    let tokens = auth::refresh(app_secret, &refresh)?;
+    if tokens.refresh != refresh {
+        keep_refresh_token(config_dir, &tokens.refresh);
+    }
+    Ok(tokens)
+}
+
+/// Which of the account's consoles playing from away uses: the first with Remote Play on, as chiaki-ng's
+/// holepunch does. The others are home network only.
+pub fn chosen(devices: &[devices::Device]) -> Option<usize> {
+    devices.iter().position(|d| d.remote_play)
+}
+
+/// The account's consoles, from the saved sign-in.
+pub fn account_consoles(app_secret: &str, config_dir: &Path) -> Result<Vec<devices::Device>, PsnError> {
+    devices::list(&sign_in(app_secret, config_dir)?.access)
+}
+
 /// Signs in with the saved refresh token in `config_dir` (keeping the new one Sony hands back), and plays the
 /// account's first console with Remote Play on.
 pub fn connect(
@@ -186,15 +208,10 @@ pub fn connect(
     profile: &VideoProfile,
     progress: Progress,
 ) -> Result<Playing, PsnError> {
-    let refresh = secret::load_refresh_token(config_dir)?
-        .ok_or(PsnError::MissingField("a saved PSN sign-in (run `ps-remote signin`)"))?;
-    let tokens = auth::refresh(app_secret, &refresh)?;
-    if tokens.refresh != refresh {
-        keep_refresh_token(config_dir, &tokens.refresh);
-    }
-    let list = devices::list(&tokens.access)?;
-    let device =
-        list.into_iter().find(|d| d.remote_play).ok_or(PsnError::MissingField("a console with Remote Play on"))?;
+    let tokens = sign_in(app_secret, config_dir)?;
+    let mut list = devices::list(&tokens.access)?;
+    let i = chosen(&list).ok_or(PsnError::MissingField("a console with Remote Play on"))?;
+    let device = list.swap_remove(i);
     let duid: [u8; 32] = device.duid.as_slice().try_into().map_err(|_| PsnError::BadField("deviceUniqueId"))?;
     let console_name = crate::printable(&device.name);
 

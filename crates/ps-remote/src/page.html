@@ -65,6 +65,19 @@ async function listConsoles() {
   $("play").disabled = !list.some((c) => c.address);
 }
 
+// The PSN account's console that Play over PSN uses. Asked once: each answer costs a sign-in refresh at Sony.
+async function listPsnConsoles() {
+  try {
+    const list = await (await api("/psn-consoles")).json();
+    const chosen = list.find((c) => c.plays_over_psn);
+    $("playpsn").textContent = chosen ? "Play " + chosen.name + " over PSN" : "Play over PSN";
+    $("playpsn").disabled = !chosen;
+    $("playpsn").title = list.filter((c) => !c.plays_over_psn).map((c) => c.name + ": home network only").join("\n");
+  } catch (e) {
+    $("playpsn").title = String(e);
+  }
+}
+
 function stick(v) { return Math.max(-32768, Math.min(32767, Math.round(v * 32767))); }
 
 function readInput() {
@@ -163,7 +176,8 @@ $("playpsn").onclick = () => playPsn().catch((e) => { $("status").textContent = 
 $("stop").onclick = async () => { if (pc) pc.close(); pc = null; channel = null; await api("/stop", { method: "POST" }); };
 $("sound").onclick = () => { $("video").muted = false; $("video").play(); };
 if (TOKEN) {
-  listConsoles().catch((e) => { $("status").textContent = String(e); });
+  // One after the other: the PSN list takes the start slot for its second or two.
+  listConsoles().catch((e) => { $("status").textContent = String(e); }).finally(listPsnConsoles);
   setInterval(showStatus, 1000);
   requestAnimationFrame(sendInput);
 } else {
