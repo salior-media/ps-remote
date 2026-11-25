@@ -46,7 +46,7 @@ pub struct Service {
     psn: Option<Psn>,
 }
 
-/// See [`Service::psn`]. Its `Debug` shows neither.
+/// See [`Service::psn`]. It has no `Debug`, so neither can be printed.
 pub struct Psn {
     pub app_secret: String,
     pub config_dir: PathBuf,
@@ -211,12 +211,24 @@ async fn search(s: &Service, to: Ipv4Addr) -> Vec<discovery::Host> {
         .unwrap_or_default()
 }
 
-/// Clears [`Service::starting`] however `play` returns.
-struct Starting<'a>(&'a AtomicBool);
+/// Clears [`Service::starting`] when dropped. It goes into the blocking start itself, so a client that gives
+/// up while a start runs cannot let a second one begin beside it (the security review of 9c-3b): the start
+/// cannot be cancelled, and only its end frees the slot.
+struct Starting(Arc<Service>);
 
-impl Drop for Starting<'_> {
+impl Starting {
+    /// Takes the slot, or `None` when a start is already under way.
+    fn take(s: &Arc<Service>) -> Option<Self> {
+        s.starting
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Starting(Arc::clone(s)))
+    }
+}
+
+impl Drop for Starting {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        self.0.starting.store(false, Ordering::Release);
     }
 }
 
@@ -247,10 +259,9 @@ async fn play(State(s): State<Arc<Service>>, axum::Json(req): axum::Json<PlayReq
     let IpAddr::V4(ip) = req.host else {
         return refuse(StatusCode::BAD_REQUEST, "consoles are found over IPv4; give the console's IPv4 address");
     };
-    if s.starting.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+    let Some(starting) = Starting::take(&s) else {
         return refuse(StatusCode::CONFLICT, "a session is already starting");
-    }
-    let _starting = Starting(&s.starting);
+    };
     if s.session().as_ref().is_some_and(Handle::is_running) {
         return refuse(StatusCode::CONFLICT, "a session is already running");
     }
@@ -265,7 +276,11 @@ async fn play(State(s): State<Arc<Service>>, axum::Json(req): axum::Json<PlayReq
         return refuse(StatusCode::BAD_REQUEST, "that address did not answer as the linked console");
     }
     // The handshakes block for a second or two: off the async runtime.
-    let started = tokio::task::spawn_blocking(move || runner::start(req.host, &console)).await;
+    let started = tokio::task::spawn_blocking(move || {
+        let _starting = starting;
+        runner::start(req.host, &console)
+    })
+    .await;
     match started {
         Ok(Ok(handle)) => {
             let old = s.session().replace(handle);
@@ -288,15 +303,18 @@ async fn play_psn(State(s): State<Arc<Service>>) -> Response {
             "playing over PSN needs PSN_RP_CLIENT_SECRET set when the service starts",
         );
     };
-    if s.starting.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+    let Some(starting) = Starting::take(&s) else {
         return refuse(StatusCode::CONFLICT, "a session is already starting");
-    }
-    let _starting = Starting(&s.starting);
+    };
     if s.session().as_ref().is_some_and(Handle::is_running) {
         return refuse(StatusCode::CONFLICT, "a session is already running");
     }
     let (secret, dir) = (psn.app_secret.clone(), psn.config_dir.clone());
-    let started = tokio::task::spawn_blocking(move || runner::start_psn(&secret, &dir)).await;
+    let started = tokio::task::spawn_blocking(move || {
+        let _starting = starting;
+        runner::start_psn(&secret, &dir)
+    })
+    .await;
     match started {
         Ok(Ok(handle)) => {
             let old = s.session().replace(handle);

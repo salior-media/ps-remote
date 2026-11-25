@@ -290,13 +290,13 @@ impl Loop {
     fn finish(self, ended: String) {
         let Loop { stream, psn, status, .. } = self;
         let _ = stream.disconnect();
-        // Sony's session is left once the console has been told the stream ended.
-        drop(psn);
-        let finish_status = status;
-        if let Ok(mut s) = finish_status.lock() {
+        if let Ok(mut s) = status.lock() {
             s.running = false;
             s.browser_connected = false;
             s.ended = Some(ended);
         }
+        // Sony's session is left last: the console has been told the stream ended, and the status no longer
+        // waits on Sony (the security review of 9c-3b).
+        drop(psn);
     }
 }

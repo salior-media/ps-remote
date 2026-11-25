@@ -9,7 +9,7 @@
 //! is dropped, whatever ended it, so none is left behind. Before that point, a failure leaves it at once.
 
 use std::net::Ipv4Addr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
@@ -81,16 +81,69 @@ struct Keeper {
     thread: Option<JoinHandle<()>>,
 }
 
+/// What leaving Sony's session takes: the session, and a sign-in that may need refreshing by then.
+struct Leave {
+    session_id: String,
+    access: String,
+    refresh: String,
+    app_secret: String,
+    config_dir: PathBuf,
+}
+
+impl Leave {
+    /// Leaves Sony's session. The access token may have expired while the stream played (the security review
+    /// of 9c-3b), so a refused leave is tried once more with a fresh one. Failures are only reported: the
+    /// session then ends at Sony when it times out.
+    fn leave(&self) {
+        if rps::leave(&self.access, &self.session_id).is_ok() {
+            return;
+        }
+        let fresh = match auth::refresh(&self.app_secret, &self.refresh) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("ps-remote: Sony's session was not left ({e}); it ends when Sony times it out");
+                return;
+            }
+        };
+        if fresh.refresh != self.refresh {
+            keep_refresh_token(&self.config_dir, &fresh.refresh);
+        }
+        if let Err(e) = rps::leave(&fresh.access, &self.session_id) {
+            eprintln!("ps-remote: Sony's session was not left ({e}); it ends when Sony times it out");
+        }
+    }
+}
+
+/// Owned by the keeper thread: however the thread ends, a panic included, or if it never starts, Sony's session
+/// is left and the websocket closed when this is dropped.
+struct LeaveOnDrop {
+    ws: Option<push::Push>,
+    leave: Leave,
+}
+
+impl Drop for LeaveOnDrop {
+    fn drop(&mut self) {
+        self.leave.leave();
+        if let Some(ws) = self.ws.take() {
+            ws.close();
+        }
+    }
+}
+
 impl Keeper {
-    fn start(mut ws: push::Push, access_token: String, session_id: String) -> Result<Self, PsnError> {
+    fn start(ws: push::Push, leave: Leave) -> Result<Self, PsnError> {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
+        let mut guard = LeaveOnDrop { ws: Some(ws), leave };
+        // If the thread cannot be made, the closure, and the guard in it, is dropped here: the session is
+        // still left.
         let thread = std::thread::Builder::new()
             .name("ps-remote psn keeper".into())
             .spawn(move || {
                 while !flag.load(Ordering::Relaxed) {
                     // Notifications are not needed once the holes are up; reading answers Sony's pings. A failure
                     // ends the reading only: the stream does not depend on the websocket.
+                    let Some(ws) = guard.ws.as_mut() else { break };
                     if ws.next(Instant::now() + KEEP_READ).is_err() {
                         while !flag.load(Ordering::Relaxed) {
                             std::thread::sleep(KEEP_READ);
@@ -98,11 +151,21 @@ impl Keeper {
                         break;
                     }
                 }
-                let _ = rps::leave(&access_token, &session_id);
-                ws.close();
+                drop(guard);
             })
             .map_err(|e| PsnError::Network(format!("could not start the push keeper: {e}")))?;
         Ok(Keeper { stop, thread: Some(thread) })
+    }
+}
+
+/// Saves a refresh token Sony rotated. A failure is reported, not fatal: what is in hand still works for this
+/// session (the security review of 9c-3b), and the next sign-in will need `ps-remote signin` only if Sony has
+/// retired the one saved.
+fn keep_refresh_token(config_dir: &Path, refresh: &str) {
+    if let Err(e) = secret::save_refresh_token(config_dir, refresh) {
+        eprintln!(
+            "ps-remote: the renewed PSN sign-in could not be saved ({e}); if a later start is refused, run `ps-remote signin`"
+        );
     }
 }
 
@@ -127,7 +190,7 @@ pub fn connect(
         .ok_or(PsnError::MissingField("a saved PSN sign-in (run `ps-remote signin`)"))?;
     let tokens = auth::refresh(app_secret, &refresh)?;
     if tokens.refresh != refresh {
-        secret::save_refresh_token(config_dir, &tokens.refresh)?;
+        keep_refresh_token(config_dir, &tokens.refresh);
     }
     let list = devices::list(&tokens.access)?;
     let device =
@@ -142,8 +205,20 @@ pub fn connect(
     progress("session created");
     match through_the_holes(&tokens.access, &rps_session, &duid, &mut ws, profile, progress) {
         Ok((ctrl, stream, local_ip, ctrl_events)) => {
-            let keeper = Keeper::start(ws, tokens.access, rps_session.created.session_id.clone())?;
-            Ok(Playing { ctrl, stream, local_ip, console_name, ctrl_events, keeper })
+            let leave = Leave {
+                session_id: rps_session.created.session_id.clone(),
+                access: tokens.access,
+                refresh: tokens.refresh,
+                app_secret: app_secret.to_string(),
+                config_dir: config_dir.to_path_buf(),
+            };
+            match Keeper::start(ws, leave) {
+                Ok(keeper) => Ok(Playing { ctrl, stream, local_ip, console_name, ctrl_events, keeper }),
+                Err(e) => {
+                    let _ = stream.disconnect();
+                    Err(e)
+                }
+            }
         }
         Err(e) => {
             // Leave whatever happened, so no session is left behind at Sony.
@@ -184,8 +259,10 @@ fn through_the_holes(
             }
             Ok(())
         });
+        // Set however the punch ends, a panic included, so the scope's wait for the poller always ends.
+        let stopper = StopOnDrop(&stop);
         let data = puncher.punch(ws, Port::Data);
-        stop.store(true, Ordering::Relaxed);
+        drop(stopper);
         (data, poller.join())
     });
     polled.map_err(|_| PsnError::Rudp("the ctrl thread panicked"))??;
@@ -194,4 +271,13 @@ fn through_the_holes(
     let (stream, events) = session::open_stream(&mut ctrl, data, profile)?;
     progress("stream connected");
     Ok((ctrl, stream, local_ip, events))
+}
+
+/// Sets its flag when dropped.
+struct StopOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
