@@ -357,7 +357,14 @@ fn ctrl_over_the_hole_is_acknowledged_and_resent_until_acknowledged() {
     console.send_to(&theirs, from).unwrap();
     assert_eq!(r.read_ctrl(Duration::from_secs(2)).unwrap(), f);
     assert_eq!(r.unacknowledged(), 0);
-    let (ack, _) = recv(&console);
+    // Resends sent before the acknowledgment came may still be queued ahead of our ACK.
+    let ack = loop {
+        let (m, _) = recv(&console);
+        if m[0].kind != rudp::CTRL_MESSAGE {
+            break m;
+        }
+        assert_eq!(m, first, "only resends of ours come before the ACK");
+    };
     assert_eq!(ack[0].kind, rudp::ACK);
     assert_eq!(&ack[0].data[2..4], &[0x40, 0x01]);
     // Nothing more is resent.
