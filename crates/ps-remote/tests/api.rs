@@ -368,3 +368,31 @@ async fn the_status_follows_the_saved_sign_in_and_sign_out_forgets_it() {
     assert_eq!(get(&s, "/api/psn-status").await.1, r#"{"available":true,"signed_in":false}"#);
     assert_eq!(post(&s, "/api/psn-signout", "").await.0, 204, "signing out twice is fine");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_chiaki_ngs_qualities_are_asked_for() {
+    let s = server().await;
+    link_fake_console(&s);
+    for body in [
+        r#"{"host":"127.0.0.1","resolution":480}"#,
+        r#"{"host":"127.0.0.1","fps":120}"#,
+        r#"{"host":"127.0.0.1","resolution":2160,"fps":60}"#,
+    ] {
+        let (code, answer) = post(&s, "/api/play", body).await;
+        assert_eq!(code, 400, "{body}: {answer}");
+        assert!(answer.contains("360, 540, 720 or 1080"), "{answer}");
+    }
+    // A quality it can ask for passes this check and goes on to look for the console.
+    let (code, answer) = post(&s, "/api/play", r#"{"host":"127.0.0.1","resolution":1080,"fps":30}"#).await;
+    assert_eq!(code, 400, "{answer}");
+    assert!(answer.contains("did not answer as"), "the quality was accepted: {answer}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn play_over_psn_takes_a_quality_or_none() {
+    let s = server_psn().await;
+    for body in [r#"{"resolution":480}"#, r#"{"fps":45}"#, r#"{"bitrate":1}"#, "not json"] {
+        let (code, answer) = post(&s, "/api/play-psn", body).await;
+        assert_eq!(code, 400, "{body}: {answer}");
+    }
+}

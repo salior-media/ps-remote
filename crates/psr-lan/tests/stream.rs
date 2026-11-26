@@ -9,6 +9,8 @@ use std::time::Duration;
 
 use base64::Engine;
 use prost::Message;
+use psr_av::frame::split_frame;
+use psr_av::video::VideoEvent;
 use psr_crypto::Target;
 use psr_crypto::ecdh::Ecdh;
 use psr_crypto::gkcrypt::GkCrypt;
@@ -17,8 +19,6 @@ use psr_input::controller::{ControllerState, button};
 use psr_input::feedback;
 use psr_lan::LanError;
 use psr_lan::session::Codec;
-use psr_av::frame::split_frame;
-use psr_av::video::VideoEvent;
 use psr_lan::stream::{self, StreamEvent, VideoProfile};
 use psr_proto::takion_message::PayloadType;
 use psr_proto::{BangPayload, ResolutionPayload, StreamInfoPayload, TakionMessage};
@@ -75,7 +75,10 @@ fn small_messages_match_nanopb() {
     assert_eq!(disconnect.disconnect_payload.unwrap().reason, "Client Disconnecting");
     assert_eq!(stream::idr_request_message(), [0x08, 0x19]);
     let corrupt = TakionMessage::decode(stream::corrupt_frame_message(7, 9).as_slice()).unwrap();
-    assert_eq!((corrupt.r#type, corrupt.corrupt_payload.map(|c| (c.start, c.end))), (PayloadType::Corruptframe as i32, Some((7, 9))));
+    assert_eq!(
+        (corrupt.r#type, corrupt.corrupt_payload.map(|c| (c.start, c.end))),
+        (PayloadType::Corruptframe as i32, Some((7, 9)))
+    );
     let controller = TakionMessage::decode(stream::controller_connection_message().as_slice()).unwrap();
     let c = controller.controller_connection_payload.unwrap();
     assert_eq!((c.controller_id, c.connected, c.controller_type), (None, Some(true), Some(2)));
@@ -220,7 +223,14 @@ fn frame_bytes(index: u16, len: usize) -> Vec<u8> {
 
 /// A protocol 12 video datagram: the header chiaki-ng's `av_packet_parse` reads, the unit encrypted at
 /// its key position plus one block, and the MAC.
-fn video_datagram(crypt: &GkCrypt, packet_index: u16, frame_index: u16, unit: usize, total: usize, unit_data: &[u8]) -> Vec<u8> {
+fn video_datagram(
+    crypt: &GkCrypt,
+    packet_index: u16,
+    frame_index: u16,
+    unit: usize,
+    total: usize,
+    unit_data: &[u8],
+) -> Vec<u8> {
     let key_pos = 0x1000 + 0x100 * u32::from(packet_index);
     let mut d = vec![0x02u8];
     d.extend_from_slice(&packet_index.to_be_bytes());
@@ -300,7 +310,8 @@ fn fake_console(socket: UdpSocket, q: Quirks) -> std::thread::JoinHandle<Seen> {
         let hk_b64 = json.split("\"handshakeKey\":\"").nth(1).unwrap().trim_end_matches("\"}");
         let hk: [u8; 16] = base64::engine::general_purpose::STANDARD.decode(hk_b64).unwrap().try_into().unwrap();
         let ecdh = Ecdh::generate().unwrap();
-        let secret = ecdh.derive_secret(big.ecdh_pub_key.as_ref().unwrap(), &hk, big.ecdh_sig.as_ref().unwrap()).unwrap();
+        let secret =
+            ecdh.derive_secret(big.ecdh_pub_key.as_ref().unwrap(), &hk, big.ecdh_sig.as_ref().unwrap()).unwrap();
         let (console_key, console_sig) = ecdh.signed_public_key(&hk);
         if q.early_stream_info {
             let (_, d) = sender.data(1, 1, &stream_info_message().encode_to_vec()).unwrap();
@@ -310,7 +321,9 @@ fn fake_console(socket: UdpSocket, q: Quirks) -> std::thread::JoinHandle<Seen> {
             assert!(matches!(got[..], [Received::DataAck { .. }]), "{got:?}");
         }
         // BANG goes out before the keys exist; the client's acknowledgement of it is already signed.
-        let (_, d) = sender.data(1, 1, &bang(true, true, Some(console_key.to_vec()), Some(console_sig.to_vec())).encode_to_vec()).unwrap();
+        let (_, d) = sender
+            .data(1, 1, &bang(true, true, Some(console_key.to_vec()), Some(console_sig.to_vec())).encode_to_vec())
+            .unwrap();
         socket.send(&d).unwrap();
         receiver.set_crypt(GkCrypt::new(2, &hk, &secret));
         sender.set_crypt(GkCrypt::new(3, &hk, &secret));
@@ -356,7 +369,10 @@ fn fake_console(socket: UdpSocket, q: Quirks) -> std::thread::JoinHandle<Seen> {
                 std::thread::sleep(Duration::from_millis(200));
                 let bye = TakionMessage {
                     r#type: PayloadType::Disconnect as i32,
-                    disconnect_payload: Some(psr_proto::DisconnectPayload { reason: "Server shutting down".into(), extended_info: None }),
+                    disconnect_payload: Some(psr_proto::DisconnectPayload {
+                        reason: "Server shutting down".into(),
+                        extended_info: None,
+                    }),
                     ..Default::default()
                 };
                 let (_, d) = sender.data(1, 1, &bye.encode_to_vec()).unwrap();
@@ -382,7 +398,8 @@ fn run_against_fake_console(q: Quirks) {
         assert!(std::time::Instant::now() < deadline, "no disconnect from the fake console; got {events:?}");
         events.extend(s.poll(Duration::from_millis(200)).unwrap());
     }
-    let video: Vec<&VideoEvent> = events.iter().filter_map(|e| if let StreamEvent::Video(v) = e { Some(v) } else { None }).collect();
+    let video: Vec<&VideoEvent> =
+        events.iter().filter_map(|e| if let StreamEvent::Video(v) = e { Some(v) } else { None }).collect();
     assert_eq!(video.len(), 4, "{video:?}");
     assert_eq!(*video[0], VideoEvent::Header { profile: 0, data: vec![0, 0, 0, 1, 0x67] });
     let VideoEvent::Frame(f1) = video[1] else { panic!("{video:?}") };
@@ -426,9 +443,17 @@ fn run_against_fake_console(q: Quirks) {
 
     let history: Vec<&SeenFeedback> = seen.feedback.iter().filter(|f| f.packet_type == 1).collect();
     assert!(history.len() >= 2, "{:?}", seen.feedback);
-    assert_eq!((history[0].seq_num, history[0].count, &history[0].payload[..]), (0, 0, &[0x80, 0x81, 0xff][..]), "the press");
+    assert_eq!(
+        (history[0].seq_num, history[0].count, &history[0].payload[..]),
+        (0, 0, &[0x80, 0x81, 0xff][..]),
+        "the press"
+    );
     let release = [0x80, 0x81, 0x00, 0x80, 0x81, 0xff];
-    assert_eq!((history[1].seq_num, history[1].count, &history[1].payload[..]), (1, 1, &release[..]), "the release, counted less one");
+    assert_eq!(
+        (history[1].seq_num, history[1].count, &history[1].payload[..]),
+        (1, 1, &release[..]),
+        "the release, counted less one"
+    );
     assert!(history[2..].iter().all(|h| h.seq_num == 1 && h.payload == release), "repeats of the release only");
     assert!(history.len() >= 4, "the release repeats at 20 and 50 ms and more: {}", history.len());
     let state: Vec<&SeenFeedback> = seen.feedback.iter().filter(|f| f.packet_type == 6).collect();
@@ -466,7 +491,25 @@ fn connect_times_out_without_a_console() {
     let silent = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let addr = silent.local_addr().unwrap();
     let start = std::time::Instant::now();
-    let err = stream::connect_at(addr, Target::Ps5V1, SESSION_ID, &rpcrypt(), &VideoProfile::p720_60(Codec::H264)).unwrap_err();
+    let err = stream::connect_at(addr, Target::Ps5V1, SESSION_ID, &rpcrypt(), &VideoProfile::p720_60(Codec::H264))
+        .unwrap_err();
     assert!(matches!(err, LanError::Timeout("stream init ack")), "{err:?}");
     assert!(start.elapsed() >= Duration::from_secs(14), "three tries of five seconds");
+}
+
+#[test]
+fn the_presets_are_chiaki_ngs() {
+    // chiaki-ng `chiaki_connect_video_profile_preset` (lib/src/session.c), read 2026-11-26.
+    assert_eq!(VideoProfile::preset(720, 60), Some(VideoProfile::p720_60(Codec::H264)));
+    assert_eq!(VideoProfile::preset(1080, 60), Some(VideoProfile::p1080_60(Codec::H264)));
+    let p = VideoProfile::preset(360, 30).unwrap();
+    assert_eq!((p.width, p.height, p.max_fps, p.bitrate_kbps), (640, 360, 30, 2_000));
+    let p = VideoProfile::preset(540, 60).unwrap();
+    assert_eq!((p.width, p.height, p.max_fps, p.bitrate_kbps), (960, 540, 60, 6_000));
+    for (h, f) in [(480, 60), (720, 59), (2160, 60), (0, 0)] {
+        assert_eq!(VideoProfile::preset(h, f), None, "{h}p {f}");
+    }
+    // A PS4 gets 720p at the same frame rate, as chiaki-ng's ctrl downgrades it.
+    assert_eq!(VideoProfile::preset(1080, 30).unwrap().at_most_720p(), VideoProfile::preset(720, 30).unwrap());
+    assert_eq!(VideoProfile::preset(540, 60).unwrap().at_most_720p(), VideoProfile::preset(540, 60).unwrap());
 }
