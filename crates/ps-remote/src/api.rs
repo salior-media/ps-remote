@@ -20,6 +20,7 @@ use psr_lan::discovery;
 use psr_lan::discovery::{Console, HostState};
 use psr_lan::regist::{self, Identity, RegisteredHost};
 use psr_lan::store;
+use psr_lan::stream::VideoProfile;
 use serde::{Deserialize, Serialize};
 use str0m::change::SdpOffer;
 use subtle::ConstantTimeEq;
@@ -247,6 +248,25 @@ struct PlayRequest {
     host: IpAddr,
     /// Which linked console, by MAC (12 hex digits). Needed only when more than one is linked.
     console: Option<String>,
+    /// The picture's height: 360, 540, 720 (the default) or 1080.
+    resolution: Option<u32>,
+    /// 30 or 60 (the default).
+    fps: Option<u32>,
+}
+
+/// The quality `play-psn` may be asked for; the same fields as [`PlayRequest`]'s.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct QualityRequest {
+    resolution: Option<u32>,
+    fps: Option<u32>,
+}
+
+/// The profile asked for, or the refusal: chiaki-ng's presets only, 720p at 60 fps unless told otherwise.
+fn profile(resolution: Option<u32>, fps: Option<u32>) -> Result<VideoProfile, Box<Response>> {
+    VideoProfile::preset(resolution.unwrap_or(720), fps.unwrap_or(60)).ok_or_else(|| {
+        Box::new(refuse(StatusCode::BAD_REQUEST, "resolution is 360, 540, 720 or 1080, and fps is 30 or 60"))
+    })
 }
 
 /// The linked console a request names by MAC, or the only one when it names none.
@@ -414,6 +434,10 @@ async fn wake(State(s): State<Arc<Service>>, axum::Json(req): axum::Json<WakeReq
 }
 
 async fn play(State(s): State<Arc<Service>>, axum::Json(req): axum::Json<PlayRequest>) -> Response {
+    let quality = match profile(req.resolution, req.fps) {
+        Ok(p) => p,
+        Err(r) => return *r,
+    };
     let list = match linked(&s) {
         Ok(l) => l,
         Err(r) => return *r,
@@ -446,7 +470,7 @@ async fn play(State(s): State<Arc<Service>>, axum::Json(req): axum::Json<PlayReq
     // The handshakes block for a second or two: off the async runtime.
     let started = tokio::task::spawn_blocking(move || {
         let _starting = starting;
-        runner::start(req.host, &console)
+        runner::start(req.host, &console, quality)
     })
     .await;
     match started {
@@ -608,12 +632,32 @@ async fn psn_consoles(State(s): State<Arc<Service>>) -> Response {
 
 /// Plays the account's console from away, through PSN (`docs/PSN.md`). No body: the console is the
 /// account's first with Remote Play on. Takes around 40 s.
-async fn play_psn(State(s): State<Arc<Service>>) -> Response {
+async fn play_psn(State(s): State<Arc<Service>>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
     let Some(psn) = s.psn.as_ref() else {
         return refuse(
             StatusCode::SERVICE_UNAVAILABLE,
             "playing over PSN needs PSN_RP_CLIENT_SECRET set when the service starts",
         );
+    };
+    // No body is the default quality; a body is `{"resolution", "fps"}`, sent as JSON like `/api/play`'s. Over PSN
+    // the console is always a PS5 (`psr_psn::play` registers as one), so 1080p needs no PS4 check here.
+    let json = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("application/json"));
+    let asked: QualityRequest = if body.is_empty() {
+        QualityRequest::default()
+    } else if !json {
+        return refuse(StatusCode::UNSUPPORTED_MEDIA_TYPE, "the body is JSON (Content-Type: application/json)");
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(q) => q,
+            Err(_) => return refuse(StatusCode::BAD_REQUEST, "the body is JSON: {\"resolution\", \"fps\"}"),
+        }
+    };
+    let quality = match profile(asked.resolution, asked.fps) {
+        Ok(p) => p,
+        Err(r) => return *r,
     };
     let Some(starting) = Starting::take(&s) else {
         return refuse(StatusCode::CONFLICT, "a session is already starting");
@@ -624,7 +668,7 @@ async fn play_psn(State(s): State<Arc<Service>>) -> Response {
     let (secret, dir) = (psn.app_secret.clone(), psn.config_dir.clone());
     let started = tokio::task::spawn_blocking(move || {
         let _starting = starting;
-        runner::start_psn(&secret, &dir)
+        runner::start_psn(&secret, &dir, quality)
     })
     .await;
     match started {

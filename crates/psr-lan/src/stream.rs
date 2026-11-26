@@ -13,18 +13,20 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use prost::Message;
-use psr_crypto::Target;
-use psr_crypto::ecdh::Ecdh;
-use psr_crypto::gkcrypt::{GkCrypt, HANDSHAKE_KEY_SIZE};
-use psr_crypto::rpcrypt::RpCrypt;
-use psr_proto::takion_message::PayloadType;
 use psr_av::audio::{AudioFrame, AudioReceiver};
 use psr_av::video::{VideoEvent, VideoReceiver};
+use psr_crypto::Target;
+use psr_crypto::ecdh::Ecdh;
+use psr_crypto::gkcrypt::BLOCK_SIZE;
+use psr_crypto::gkcrypt::{GkCrypt, HANDSHAKE_KEY_SIZE};
+use psr_crypto::rpcrypt::RpCrypt;
 use psr_input::controller::ControllerState;
 use psr_input::feedback;
 use psr_input::sender::{Feedback, FeedbackSender};
-use psr_crypto::gkcrypt::BLOCK_SIZE;
-use psr_proto::{BigPayload, ControllerConnectionPayload, CorruptFramePayload, DisconnectPayload, StreamInfoPayload, TakionMessage};
+use psr_proto::takion_message::PayloadType;
+use psr_proto::{
+    BigPayload, ControllerConnectionPayload, CorruptFramePayload, DisconnectPayload, StreamInfoPayload, TakionMessage,
+};
 use psr_takion::av::{self, AvPacket, AvVersion};
 use psr_takion::av_queue::AvQueue;
 use psr_takion::connection::{self, Received, Receiver, Sender, data_type};
@@ -79,16 +81,48 @@ impl VideoProfile {
     pub const fn p1080_60(codec: Codec) -> Self {
         Self { width: 1920, height: 1080, max_fps: 60, bitrate_kbps: 15_000, codec }
     }
+
+    /// chiaki-ng `chiaki_connect_video_profile_preset`, in H.264: a height of 360, 540, 720 or 1080 (each with
+    /// chiaki-ng's width and bitrate) at 30 or 60 fps. `None` for anything else.
+    pub const fn preset(height: u32, fps: u32) -> Option<Self> {
+        let (width, bitrate_kbps) = match height {
+            360 => (640, 2_000),
+            540 => (960, 6_000),
+            720 => (1280, 10_000),
+            1080 => (1920, 15_000),
+            _ => return None,
+        };
+        if fps != 30 && fps != 60 {
+            return None;
+        }
+        Some(Self { width, height, max_fps: fps, bitrate_kbps, codec: Codec::H264 })
+    }
+
+    /// The same frame rate at 720p, for a console that cannot send 1080p (chiaki-ng downgrades a PS4 in
+    /// `lib/src/ctrl.c`); `self` otherwise.
+    pub const fn at_most_720p(self) -> Self {
+        if self.height > 720 { Self { width: 1280, height: 720, bitrate_kbps: 10_000, ..self } } else { self }
+    }
 }
 
 /// chiaki-ng `chiaki_launchspec_format`, character for character.
-pub fn launch_spec(target: Target, profile: &VideoProfile, mtu: u32, rtt_ms: u32, handshake_key: &[u8; HANDSHAKE_KEY_SIZE]) -> String {
+pub fn launch_spec(
+    target: Target,
+    profile: &VideoProfile,
+    mtu: u32,
+    rtt_ms: u32,
+    handshake_key: &[u8; HANDSHAKE_KEY_SIZE],
+) -> String {
     let key = base64::engine::general_purpose::STANDARD.encode(handshake_key);
     let (adaptive, codec, range) = if target.is_ps5() {
         (
             ",\"adaptiveStreamMode\": \"resize\"",
             if matches!(profile.codec, Codec::H264) { "\"videoCodec\":\"avc\"," } else { "\"videoCodec\":\"hevc\"," },
-            if matches!(profile.codec, Codec::H265Hdr) { "\"dynamicRange\":\"HDR\"," } else { "\"dynamicRange\":\"SDR\"," },
+            if matches!(profile.codec, Codec::H265Hdr) {
+                "\"dynamicRange\":\"HDR\","
+            } else {
+                "\"dynamicRange\":\"SDR\","
+            },
         )
     } else {
         ("", "", "")
@@ -122,7 +156,13 @@ pub fn encode_launch_spec(crypt: &RpCrypt, json: &str) -> String {
 }
 
 /// chiaki-ng's BIG message. The encrypted key is four zero bytes, as chiaki-ng sends it.
-pub fn big_message(client_version: u32, session_id: &str, launch_spec_b64: &str, pub_key: &[u8], sig: &[u8]) -> Vec<u8> {
+pub fn big_message(
+    client_version: u32,
+    session_id: &str,
+    launch_spec_b64: &str,
+    pub_key: &[u8],
+    sig: &[u8],
+) -> Vec<u8> {
     TakionMessage {
         r#type: PayloadType::Big as i32,
         big_payload: Some(BigPayload {
@@ -178,7 +218,10 @@ pub fn microphone_audio_header() -> [u8; AUDIO_HEADER_SIZE] {
 /// chiaki-ng `stream_connection_enable_microphone`: a stream info message carrying only our audio header.
 pub fn microphone_message() -> Vec<u8> {
     TakionMessage {
-        stream_info_payload: Some(StreamInfoPayload { audio_header: microphone_audio_header().to_vec(), ..Default::default() }),
+        stream_info_payload: Some(StreamInfoPayload {
+            audio_header: microphone_audio_header().to_vec(),
+            ..Default::default()
+        }),
         ..typed(PayloadType::Streaminfo)
     }
     .encode_to_vec()
@@ -214,7 +257,8 @@ pub fn stream_keys(
     remote_pub_key: &[u8],
     remote_sig: &[u8],
 ) -> Result<(GkCrypt, GkCrypt), LanError> {
-    let secret = ecdh.derive_secret(remote_pub_key, handshake_key, remote_sig).map_err(|e| LanError::Bang(e.to_string()))?;
+    let secret =
+        ecdh.derive_secret(remote_pub_key, handshake_key, remote_sig).map_err(|e| LanError::Bang(e.to_string()))?;
     Ok((GkCrypt::new(2, handshake_key, &secret), GkCrypt::new(3, handshake_key, &secret)))
 }
 
@@ -227,8 +271,13 @@ pub fn check_bang(msg: &TakionMessage) -> Result<(Vec<u8>, Vec<u8>), LanError> {
     if !bang.encrypted_key_accepted {
         return Err(LanError::Bang("the console did not accept the encrypted key".into()));
     }
-    let key = bang.ecdh_pub_key.clone().filter(|k| !k.is_empty()).ok_or_else(|| LanError::Bang("no ECDH public key".into()))?;
-    let sig = bang.ecdh_sig.clone().filter(|s| !s.is_empty()).ok_or_else(|| LanError::Bang("no ECDH signature".into()))?;
+    let key = bang
+        .ecdh_pub_key
+        .clone()
+        .filter(|k| !k.is_empty())
+        .ok_or_else(|| LanError::Bang("no ECDH public key".into()))?;
+    let sig =
+        bang.ecdh_sig.clone().filter(|s| !s.is_empty()).ok_or_else(|| LanError::Bang("no ECDH signature".into()))?;
     Ok((key, sig))
 }
 
@@ -249,7 +298,8 @@ pub struct StreamInfo {
 
 pub fn parse_stream_info(msg: &TakionMessage) -> Result<StreamInfo, LanError> {
     let info = msg.stream_info_payload.as_ref().ok_or(LanError::StreamInfo("no stream info payload"))?;
-    let audio_header = info.audio_header.as_slice().try_into().map_err(|_| LanError::StreamInfo("audio header is not 14 bytes"))?;
+    let audio_header =
+        info.audio_header.as_slice().try_into().map_err(|_| LanError::StreamInfo("audio header is not 14 bytes"))?;
     Ok(StreamInfo {
         resolutions: info
             .resolution
@@ -365,7 +415,8 @@ pub fn connect_at(
     rpcrypt: &RpCrypt,
     profile: &VideoProfile,
 ) -> Result<Stream, LanError> {
-    let any: IpAddr = if addr.is_ipv4() { std::net::Ipv4Addr::UNSPECIFIED.into() } else { std::net::Ipv6Addr::UNSPECIFIED.into() };
+    let any: IpAddr =
+        if addr.is_ipv4() { std::net::Ipv4Addr::UNSPECIFIED.into() } else { std::net::Ipv6Addr::UNSPECIFIED.into() };
     let socket = UdpSocket::bind((any, 0)).map_err(io)?;
     socket.connect(addr).map_err(io)?;
     connect_on(socket, target, session_id, rpcrypt, profile)
@@ -380,7 +431,6 @@ pub fn connect_on(
     rpcrypt: &RpCrypt,
     profile: &VideoProfile,
 ) -> Result<Stream, LanError> {
-
     let mut random = [0u8; 4 + HANDSHAKE_KEY_SIZE];
     getrandom::fill(&mut random).map_err(|e| LanError::Random(e.to_string()))?;
     let tag_local = u32::from_be_bytes(random[..4].try_into().expect("4 bytes")).max(1);
@@ -429,7 +479,8 @@ pub fn connect_on(
     let info = match early_info.take() {
         Some(m) => m,
         None => {
-            let (m, ack) = stream.wait_for(|msg| msg.r#type == PayloadType::Streaminfo as i32, &mut None, "stream info")?;
+            let (m, ack) =
+                stream.wait_for(|msg| msg.r#type == PayloadType::Streaminfo as i32, &mut None, "stream info")?;
             stream.ack(ack)?;
             m
         }
@@ -613,7 +664,10 @@ impl Stream {
     ) -> Result<(TakionMessage, Option<u32>), LanError> {
         let deadline = Instant::now() + EXPECT_TIMEOUT;
         loop {
-            let left = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()).ok_or(LanError::Timeout(what))?;
+            let left = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|d| !d.is_zero())
+                .ok_or(LanError::Timeout(what))?;
             let Some(d) = recv(&self.socket, left)? else { continue };
             let (messages, ack) = self.take(&d)?;
             let mut found = None;

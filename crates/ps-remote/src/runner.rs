@@ -43,6 +43,8 @@ pub struct Status {
     pub bad_input: u64,
     /// Why the session ended, once it has.
     pub ended: Option<String>,
+    /// The quality asked of the console: `"<width>x<height> at <fps> fps"`.
+    pub video: Option<String>,
 }
 
 enum Command {
@@ -98,22 +100,23 @@ pub fn media_address(host: IpAddr) -> std::io::Result<IpAddr> {
 
 /// Starts a session with `console` at `host` (this blocks for the session and stream handshakes, a second
 /// or two), then runs it on its own thread.
-pub fn start(host: IpAddr, console: &RegisteredHost) -> Result<Handle, String> {
+pub fn start(host: IpAddr, console: &RegisteredHost, profile: VideoProfile) -> Result<Handle, String> {
     let media_ip = media_address(host).map_err(|e| format!("no route to the console: {e}"))?;
     let ctrl = session::start(host, console, Codec::H264).map_err(|e| e.to_string())?;
-    let stream = stream::connect(host, &ctrl, &VideoProfile::p720_60(Codec::H264)).map_err(|e| e.to_string())?;
-    spawn(ctrl, stream, media_ip, None)
+    // A PS4 is not asked for 1080p, as chiaki-ng does not; a PS4 Pro could send it, but is not told apart here.
+    let profile = if ctrl.target().is_ps5() { profile } else { profile.at_most_720p() };
+    let stream = stream::connect(host, &ctrl, &profile).map_err(|e| e.to_string())?;
+    spawn(ctrl, stream, media_ip, None, profile)
 }
 
 /// Starts a session from away, through PSN (`psr_psn::play`; this blocks for the holepunch, around 40 s),
 /// then runs it as [`start`] does. Sony's session is left when the session ends.
-pub fn start_psn(app_secret: &str, config_dir: &Path) -> Result<Handle, String> {
-    let playing = psr_psn::play::connect(app_secret, config_dir, &VideoProfile::p720_60(Codec::H264), |_| {})
-        .map_err(|e| e.to_string())?;
+pub fn start_psn(app_secret: &str, config_dir: &Path, profile: VideoProfile) -> Result<Handle, String> {
+    let playing = psr_psn::play::connect(app_secret, config_dir, &profile, |_| {}).map_err(|e| e.to_string())?;
     // The browser is on this machine: its media goes to our address on the network the holes left by.
     let media_ip = IpAddr::V4(playing.local_ip);
     let (ctrl, stream, leaver) = playing.into_parts();
-    spawn(ctrl, stream, media_ip, Some(leaver))
+    spawn(ctrl, stream, media_ip, Some(leaver), profile)
 }
 
 fn spawn(
@@ -121,10 +124,12 @@ fn spawn(
     stream: Stream,
     media_ip: IpAddr,
     psn: Option<psr_psn::play::Leaver>,
+    profile: VideoProfile,
 ) -> Result<Handle, String> {
     let touchpad = Touchpad::new(ctrl.target().is_ps5());
     let (tx, rx) = mpsc::channel();
-    let status = Arc::new(Mutex::new(Status { running: true, ..Status::default() }));
+    let video = format!("{}x{} at {} fps", profile.width, profile.height, profile.max_fps);
+    let status = Arc::new(Mutex::new(Status { running: true, video: Some(video), ..Status::default() }));
     let thread_status = Arc::clone(&status);
     let thread = std::thread::Builder::new()
         .name("ps-remote session".into())
