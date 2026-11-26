@@ -395,4 +395,17 @@ async fn play_over_psn_takes_a_quality_or_none() {
         let (code, answer) = post(&s, "/api/play-psn", body).await;
         assert_eq!(code, 400, "{body}: {answer}");
     }
+    // A body of another type is refused; `request` sends JSON, so this one is sent by hand.
+    let mut c = tokio::net::TcpStream::connect(("127.0.0.1", s.port)).await.unwrap();
+    let body = r#"{"resolution":720}"#;
+    let req = format!(
+        "POST /api/play-psn HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        s.port,
+        s.token,
+        body.len()
+    );
+    c.write_all(req.as_bytes()).await.unwrap();
+    let mut out = Vec::new();
+    let _ = c.read_to_end(&mut out).await;
+    assert_eq!(&out[9..12], b"415", "{}", String::from_utf8_lossy(&out));
 }

@@ -632,16 +632,23 @@ async fn psn_consoles(State(s): State<Arc<Service>>) -> Response {
 
 /// Plays the account's console from away, through PSN (`docs/PSN.md`). No body: the console is the
 /// account's first with Remote Play on. Takes around 40 s.
-async fn play_psn(State(s): State<Arc<Service>>, body: axum::body::Bytes) -> Response {
+async fn play_psn(State(s): State<Arc<Service>>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
     let Some(psn) = s.psn.as_ref() else {
         return refuse(
             StatusCode::SERVICE_UNAVAILABLE,
             "playing over PSN needs PSN_RP_CLIENT_SECRET set when the service starts",
         );
     };
-    // No body is the default quality; a body is `{"resolution", "fps"}`.
+    // No body is the default quality; a body is `{"resolution", "fps"}`, sent as JSON like `/api/play`'s. Over PSN
+    // the console is always a PS5 (`psr_psn::play` registers as one), so 1080p needs no PS4 check here.
+    let json = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("application/json"));
     let asked: QualityRequest = if body.is_empty() {
         QualityRequest::default()
+    } else if !json {
+        return refuse(StatusCode::UNSUPPORTED_MEDIA_TYPE, "the body is JSON (Content-Type: application/json)");
     } else {
         match serde_json::from_slice(&body) {
             Ok(q) => q,
