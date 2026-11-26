@@ -165,3 +165,38 @@ impl Touchpad {
         (self.slots.touches, self.slots.touch_id_next)
     }
 }
+
+/// Where the browser's input goes: to the console, through the touchpad's ids, or nowhere in a watch-only session.
+/// A watch-only session is for someone playing on the TV with their own controller while this PC shows the game
+/// (to share it in Discord, say): nothing the browser sends may press anything for them.
+#[derive(Debug, Clone)]
+pub struct Controls {
+    touchpad: Touchpad,
+    watch_only: bool,
+}
+
+impl Controls {
+    pub fn new(ps5: bool, watch_only: bool) -> Self {
+        Controls { touchpad: Touchpad::new(ps5), watch_only }
+    }
+
+    pub fn watch_only(&self) -> bool {
+        self.watch_only
+    }
+
+    /// The controller state to send for `input`, or `None` in a watch-only session, which sends the browser's
+    /// input nowhere.
+    pub fn apply(&mut self, input: &Input) -> Option<ControllerState> {
+        if self.watch_only {
+            return None;
+        }
+        let mut state = input.state;
+        (state.touches, state.touch_id_next) = self.touchpad.apply(&input.fingers);
+        Some(state)
+    }
+
+    /// Lifts every finger.
+    pub fn clear(&mut self) {
+        self.touchpad.clear();
+    }
+}

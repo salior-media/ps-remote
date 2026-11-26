@@ -95,3 +95,25 @@ fn the_touchpad_keeps_each_fingers_console_id_and_scales_to_the_console() {
     let (t, _) = input::Touchpad::new(false).apply(&[f(0, 1.0, 1.0)]);
     assert_eq!((t[0].x, t[0].y), (1920, 942));
 }
+
+#[test]
+fn a_playing_session_sends_the_browsers_input_with_its_fingers() {
+    let mut c = input::Controls::new(true, false);
+    let msg = input::parse_input(br#"{"buttons":1,"touches":[{"id":0,"x":0.5,"y":0.5}]}"#).unwrap();
+    let state = c.apply(&msg).expect("a playing session takes input");
+    assert_eq!(state.buttons, button::CROSS);
+    assert!(state.touches[0].id.is_some(), "the finger is down on the console's touchpad");
+    assert!(!c.watch_only());
+}
+
+#[test]
+fn a_watch_only_session_sends_nothing_from_the_browser() {
+    let mut c = input::Controls::new(true, true);
+    assert!(c.watch_only());
+    let messages: [&[u8]; 4] =
+        [br#"{"buttons":1}"#, br#"{"lx":32767,"r2":255}"#, br#"{"touches":[{"id":0,"x":0.1,"y":0.9}]}"#, b"{}"];
+    for raw in messages {
+        let msg = input::parse_input(raw).unwrap();
+        assert_eq!(c.apply(&msg), None, "{}", String::from_utf8_lossy(raw));
+    }
+}

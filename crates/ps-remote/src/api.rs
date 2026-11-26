@@ -252,14 +252,19 @@ struct PlayRequest {
     resolution: Option<u32>,
     /// 30 or 60 (the default).
     fps: Option<u32>,
+    /// Watch only: show the game and drop the browser's input, for someone playing on the TV (default false).
+    #[serde(default)]
+    watch_only: bool,
 }
 
-/// The quality `play-psn` may be asked for; the same fields as [`PlayRequest`]'s.
+/// What `play-psn` may be asked for: [`PlayRequest`]'s fields, less the console's.
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct QualityRequest {
     resolution: Option<u32>,
     fps: Option<u32>,
+    #[serde(default)]
+    watch_only: bool,
 }
 
 /// The profile asked for, or the refusal: chiaki-ng's presets only, 720p at 60 fps unless told otherwise.
@@ -470,7 +475,7 @@ async fn play(State(s): State<Arc<Service>>, axum::Json(req): axum::Json<PlayReq
     // The handshakes block for a second or two: off the async runtime.
     let started = tokio::task::spawn_blocking(move || {
         let _starting = starting;
-        runner::start(req.host, &console, quality)
+        runner::start(req.host, &console, quality, req.watch_only)
     })
     .await;
     match started {
@@ -639,7 +644,7 @@ async fn play_psn(State(s): State<Arc<Service>>, headers: HeaderMap, body: axum:
             "playing over PSN needs PSN_RP_CLIENT_SECRET set when the service starts",
         );
     };
-    // No body is the default quality; a body is `{"resolution", "fps"}`, sent as JSON like `/api/play`'s. Over PSN
+    // No body is the default quality; a body is `{"resolution", "fps", "watch_only"}`, sent as JSON like `/api/play`'s. Over PSN
     // the console is always a PS5 (`psr_psn::play` registers as one), so 1080p needs no PS4 check here.
     let json = headers
         .get(header::CONTENT_TYPE)
@@ -652,9 +657,10 @@ async fn play_psn(State(s): State<Arc<Service>>, headers: HeaderMap, body: axum:
     } else {
         match serde_json::from_slice(&body) {
             Ok(q) => q,
-            Err(_) => return refuse(StatusCode::BAD_REQUEST, "the body is JSON: {\"resolution\", \"fps\"}"),
+            Err(_) => return refuse(StatusCode::BAD_REQUEST, "the body is JSON: {\"resolution\", \"fps\", \"watch_only\"}"),
         }
     };
+    let watch_only = asked.watch_only;
     let quality = match profile(asked.resolution, asked.fps) {
         Ok(p) => p,
         Err(r) => return *r,
@@ -668,7 +674,7 @@ async fn play_psn(State(s): State<Arc<Service>>, headers: HeaderMap, body: axum:
     let (secret, dir) = (psn.app_secret.clone(), psn.config_dir.clone());
     let started = tokio::task::spawn_blocking(move || {
         let _starting = starting;
-        runner::start_psn(&secret, &dir, quality)
+        runner::start_psn(&secret, &dir, quality, watch_only)
     })
     .await;
     match started {
