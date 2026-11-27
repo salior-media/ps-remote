@@ -192,10 +192,16 @@ pub fn streaminfo_ack_message() -> Vec<u8> {
 
 /// chiaki-ng `stream_connection_send_controller_connection`, with DualSense features off: a DualShock 4.
 pub fn controller_connection_message() -> Vec<u8> {
+    controller_connection_message_for(None, true)
+}
+
+/// The same message for a controller named by id, connected or not. chiaki-ng never sets the id; naming controller 1
+/// is the second-controller experiment's question (games scope next §3).
+pub fn controller_connection_message_for(controller_id: Option<i32>, connected: bool) -> Vec<u8> {
     TakionMessage {
         controller_connection_payload: Some(ControllerConnectionPayload {
-            controller_id: None,
-            connected: Some(true),
+            controller_id,
+            connected: Some(connected),
             controller_type: Some(psr_proto::controller_connection_payload::ControllerType::Dualshock4 as i32),
         }),
         ..typed(PayloadType::Controllerconnection)
@@ -513,6 +519,12 @@ impl Stream {
         let (_, d) = self.sender.data(1, channel, msg)?;
         self.socket.send(&d).map_err(io)?;
         Ok(())
+    }
+
+    /// Tells the console a controller with this id connected or went away. For the second-controller experiment
+    /// (games scope next §3): whether a PS5 takes a second controller over one session is not known yet.
+    pub fn announce_controller(&mut self, controller_id: i32, connected: bool) -> Result<(), LanError> {
+        self.send_message(CHANNEL, &controller_connection_message_for(Some(controller_id), connected))
     }
 
     /// Asks the console for a keyframe: the answer to a decoder that lost its picture (a WebRTC PLI).

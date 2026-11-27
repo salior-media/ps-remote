@@ -85,6 +85,18 @@ fn small_messages_match_nanopb() {
 }
 
 #[test]
+fn a_second_controller_can_be_announced_by_id() {
+    // The second-controller experiment (games scope next §3): the same message, naming controller 1.
+    let m = TakionMessage::decode(stream::controller_connection_message_for(Some(1), true).as_slice()).unwrap();
+    assert_eq!(m.r#type, PayloadType::Controllerconnection as i32);
+    let c = m.controller_connection_payload.unwrap();
+    assert_eq!((c.controller_id, c.connected, c.controller_type), (Some(1), Some(true), Some(2)));
+    let gone = TakionMessage::decode(stream::controller_connection_message_for(Some(1), false).as_slice()).unwrap();
+    assert_eq!(gone.controller_connection_payload.unwrap().connected, Some(false));
+    assert_eq!(stream::controller_connection_message(), stream::controller_connection_message_for(None, true));
+}
+
+#[test]
 fn microphone_header_bytes_follow_chiaki_ngs_save_order() {
     assert_eq!(stream::microphone_audio_header(), [1, 16, 0, 0, 0xbb, 0x80, 0, 0, 0x01, 0xe0, 0, 0, 0, 1]);
 }
