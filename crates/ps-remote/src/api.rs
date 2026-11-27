@@ -11,7 +11,8 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::extract::{DefaultBodyLimit, FromRequestParts, Request, State};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
@@ -39,7 +40,10 @@ pub struct Service {
     /// The `Host` values accepted: `127.0.0.1:<port>` and `localhost:<port>`.
     hosts: [String; 2],
     consoles_dir: PathBuf,
-    session: Mutex<Option<Handle>>,
+    /// Each account's own folder is `<accounts_dir>/<sub>/`, holding its PSN sign-in and its `consoles/`
+    /// (games scope *PlayStation next* §4.1).
+    accounts_dir: PathBuf,
+    session: Mutex<Option<Running>>,
     /// A session start is under way: a second one is refused until it ends.
     starting: AtomicBool,
     /// One discovery search at a time, so many requests cannot fill the blocking pool with them.
@@ -47,6 +51,43 @@ pub struct Service {
     /// What playing over PSN needs, when the service was started with it: Sony's Remote Play app secret
     /// (from the environment, never stored) and the folder with the saved sign-in.
     psn: Option<Psn>,
+}
+
+/// The running session and the account that started it: only that account may send it an offer or stop it.
+struct Running {
+    account: Account,
+    handle: Handle,
+}
+
+/// Whose request this is: game-play's [`ACCOUNT_HEADER`], an Authentik `hashed_user_id`, or `None` for this PC's
+/// own folders (the command line, the examples, a client that names no account). Only a caller holding the token can
+/// send it, and that caller can already do anything the API does, so the header is taken as given; its shape is
+/// checked because it names a folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Account(Option<String>);
+
+/// The header naming the account (games `game-play/src/forward.rs`).
+pub const ACCOUNT_HEADER: &str = "x-ps-remote-account";
+
+fn is_hashed_user_id(sub: &str) -> bool {
+    sub.len() == 64 && sub.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+impl<S: Send + Sync> FromRequestParts<S> for Account {
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+        let mut given = parts.headers.get_all(ACCOUNT_HEADER).iter();
+        let (first, second) = (given.next(), given.next());
+        match (first, second) {
+            (None, _) => Ok(Account(None)),
+            (Some(v), None) => match v.to_str() {
+                Ok(sub) if is_hashed_user_id(sub) => Ok(Account(Some(sub.to_string()))),
+                _ => Err(refuse(StatusCode::BAD_REQUEST, "the account is 64 lowercase hex digits")),
+            },
+            (Some(_), Some(_)) => Err(refuse(StatusCode::BAD_REQUEST, "one account per request")),
+        }
+    }
 }
 
 /// See [`Service::psn`]. It has no `Debug`, so neither can be printed.
@@ -64,25 +105,55 @@ impl std::fmt::Debug for Service {
 impl Service {
     /// The session slot. A handler that panicked holding it leaves nothing half-written (it holds an
     /// `Option` that is replaced whole), so a poisoned lock is still usable.
-    fn session(&self) -> MutexGuard<'_, Option<Handle>> {
+    fn session(&self) -> MutexGuard<'_, Option<Running>> {
         self.session.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Without PSN; each account's folder is under `consoles_dir/accounts`.
     pub fn new(token: String, port: u16, consoles_dir: PathBuf) -> Arc<Self> {
-        Self::with_psn(token, port, consoles_dir, None)
+        let accounts_dir = consoles_dir.join("accounts");
+        Self::with_psn(token, port, consoles_dir, accounts_dir, None)
     }
 
-    /// [`Service::new`], able to play over PSN too.
-    pub fn with_psn(token: String, port: u16, consoles_dir: PathBuf, psn: Option<Psn>) -> Arc<Self> {
+    /// [`Service::new`], able to play over PSN too, with each account's folder under `accounts_dir`.
+    pub fn with_psn(
+        token: String,
+        port: u16,
+        consoles_dir: PathBuf,
+        accounts_dir: PathBuf,
+        psn: Option<Psn>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             token,
             hosts: [format!("127.0.0.1:{port}"), format!("localhost:{port}")],
             consoles_dir,
+            accounts_dir,
             session: Mutex::new(None),
             starting: AtomicBool::new(false),
             discovery: tokio::sync::Mutex::new(()),
             psn,
         })
+    }
+
+    /// The folder holding `account`'s linked consoles.
+    fn consoles_of(&self, account: &Account) -> PathBuf {
+        match &account.0 {
+            Some(sub) => self.accounts_dir.join(sub).join("consoles"),
+            None => self.consoles_dir.clone(),
+        }
+    }
+
+    /// The folder holding `account`'s PSN sign-in.
+    fn psn_of(&self, psn: &Psn, account: &Account) -> PathBuf {
+        match &account.0 {
+            Some(sub) => self.accounts_dir.join(sub),
+            None => psn.config_dir.clone(),
+        }
+    }
+
+    /// Whether a session is running, whoever's.
+    fn running(&self) -> bool {
+        self.session().as_ref().is_some_and(|r| r.handle.is_running())
     }
 }
 
@@ -176,8 +247,8 @@ fn mac_hex(mac: &[u8; 6]) -> String {
 }
 
 /// The saved registrations, or the response that says why they could not be read.
-fn linked(s: &Service) -> Result<Vec<RegisteredHost>, Box<Response>> {
-    store::load_all(&s.consoles_dir)
+fn linked(s: &Service, account: &Account) -> Result<Vec<RegisteredHost>, Box<Response>> {
+    store::load_all(&s.consoles_of(account))
         .map_err(|e| Box::new(refuse_owned(StatusCode::INTERNAL_SERVER_ERROR, format!("the linked consoles: {e}"))))
 }
 
@@ -186,8 +257,8 @@ fn refuse_owned(code: StatusCode, why: String) -> Response {
 }
 
 /// The linked consoles, without their keys, each with where it answered on the home network.
-async fn consoles(State(s): State<Arc<Service>>) -> Response {
-    let list = match linked(&s) {
+async fn consoles(State(s): State<Arc<Service>>, account: Account) -> Response {
+    let list = match linked(&s, &account) {
         Ok(l) => l,
         Err(r) => return *r,
     };
@@ -328,7 +399,11 @@ fn same_console(host_id: Option<&str>, registered_mac: &[u8; 6]) -> bool {
 }
 
 /// Links with the console at `host` (`docs/SERVICE.md`, step 8c), as the `link` example does.
-async fn link(State(s): State<Arc<Service>>, body: Result<axum::Json<LinkRequest>, JsonRejection>) -> Response {
+async fn link(
+    State(s): State<Arc<Service>>,
+    account: Account,
+    body: Result<axum::Json<LinkRequest>, JsonRejection>,
+) -> Response {
     // axum's own refusal quotes the value it could not read, which could be the PIN: a fixed message instead.
     let req = match body {
         Ok(axum::Json(req)) => req,
@@ -362,8 +437,8 @@ async fn link(State(s): State<Arc<Service>>, body: Result<axum::Json<LinkRequest
     let Some(found) = search(&s, ip).await.into_iter().find(|h| h.addr == req.host) else {
         return refuse(StatusCode::BAD_REQUEST, "that address did not answer discovery as a console; is it on?");
     };
-    let psn = s.psn.as_ref().map(|p| (p.app_secret.clone(), p.config_dir.clone()));
-    let dir = s.consoles_dir.clone();
+    let psn = s.psn.as_ref().map(|p| (p.app_secret.clone(), s.psn_of(p, &account)));
+    let dir = s.consoles_of(&account);
     // Registration and the account ID lookup block for seconds: off the async runtime, holding the start slot.
     let done = tokio::task::spawn_blocking(move || {
         let _starting = starting;
@@ -402,8 +477,8 @@ struct WakeRequest {
 /// address that claims to be that console. The claim is unauthenticated (discovery is plain UDP), so this keeps
 /// the credential from going to the wrong address by mistake; it does not stop a device on the home network that
 /// lies, which could also read the datagram off the network.
-async fn wake(State(s): State<Arc<Service>>, axum::Json(req): axum::Json<WakeRequest>) -> Response {
-    let list = match linked(&s) {
+async fn wake(State(s): State<Arc<Service>>, account: Account, axum::Json(req): axum::Json<WakeRequest>) -> Response {
+    let list = match linked(&s, &account) {
         Ok(l) => l,
         Err(r) => return *r,
     };
@@ -438,12 +513,12 @@ async fn wake(State(s): State<Arc<Service>>, axum::Json(req): axum::Json<WakeReq
     }
 }
 
-async fn play(State(s): State<Arc<Service>>, axum::Json(req): axum::Json<PlayRequest>) -> Response {
+async fn play(State(s): State<Arc<Service>>, account: Account, axum::Json(req): axum::Json<PlayRequest>) -> Response {
     let quality = match profile(req.resolution, req.fps) {
         Ok(p) => p,
         Err(r) => return *r,
     };
-    let list = match linked(&s) {
+    let list = match linked(&s, &account) {
         Ok(l) => l,
         Err(r) => return *r,
     };
@@ -459,7 +534,7 @@ async fn play(State(s): State<Arc<Service>>, axum::Json(req): axum::Json<PlayReq
     let Some(starting) = Starting::take(&s) else {
         return refuse(StatusCode::CONFLICT, "a session is already starting");
     };
-    if s.session().as_ref().is_some_and(Handle::is_running) {
+    if s.running() {
         return refuse(StatusCode::CONFLICT, "a session is already running");
     }
     // The session request carries credentials made from the console's keys, so it only goes to an address
@@ -480,9 +555,9 @@ async fn play(State(s): State<Arc<Service>>, axum::Json(req): axum::Json<PlayReq
     .await;
     match started {
         Ok(Ok(handle)) => {
-            let old = s.session().replace(handle);
+            let old = s.session().replace(Running { account, handle });
             if let Some(old) = old {
-                tokio::task::spawn_blocking(move || old.stop());
+                tokio::task::spawn_blocking(move || old.handle.stop());
             }
             StatusCode::NO_CONTENT.into_response()
         }
@@ -495,15 +570,15 @@ const PSN_OFF: &str = "playing over PSN needs PSN_RP_CLIENT_SECRET set when the 
 
 /// Whether playing over PSN is on, and whether a sign-in is saved (`docs/SERVICE.md`, step 8d). Only the file's
 /// presence is looked at: the sign-in is not opened, so one that no longer opens can still be replaced or forgotten.
-async fn psn_status(State(s): State<Arc<Service>>) -> Response {
-    let signed_in = s.psn.as_ref().is_some_and(|psn| psr_psn::secret::is_saved(&psn.config_dir));
+async fn psn_status(State(s): State<Arc<Service>>, account: Account) -> Response {
+    let signed_in = s.psn.as_ref().is_some_and(|psn| psr_psn::secret::is_saved(&s.psn_of(psn, &account)));
     axum::Json(serde_json::json!({ "available": s.psn.is_some(), "signed_in": signed_in })).into_response()
 }
 
 /// A running session keeps its own tokens, and may save a renewed refresh token when it ends
 /// (`psr_psn::play::Leave`). Signing in or out under it could be undone by that save, so both wait for it to end.
 fn session_running(s: &Service) -> bool {
-    s.session().as_ref().is_some_and(Handle::is_running)
+    s.running()
 }
 
 /// Sony's sign-in page, with a new client device ID, as `ps-remote signin` prints it.
@@ -530,7 +605,11 @@ struct SigninRequest {
 
 /// Trades the code in Sony's redirect address for tokens and saves the refresh token, as `ps-remote signin`
 /// does. The address carries a one-time code, so it is never echoed: refusals are fixed sentences.
-async fn psn_signin(State(s): State<Arc<Service>>, body: Result<axum::Json<SigninRequest>, JsonRejection>) -> Response {
+async fn psn_signin(
+    State(s): State<Arc<Service>>,
+    account: Account,
+    body: Result<axum::Json<SigninRequest>, JsonRejection>,
+) -> Response {
     let Some(psn) = s.psn.as_ref() else {
         return refuse(StatusCode::SERVICE_UNAVAILABLE, PSN_OFF);
     };
@@ -550,7 +629,7 @@ async fn psn_signin(State(s): State<Arc<Service>>, body: Result<axum::Json<Signi
     if session_running(&s) {
         return refuse(StatusCode::CONFLICT, "stop the session first: it would keep its own sign-in");
     }
-    let (secret, dir) = (psn.app_secret.clone(), psn.config_dir.clone());
+    let (secret, dir) = (psn.app_secret.clone(), s.psn_of(psn, &account));
     let done = tokio::task::spawn_blocking(move || {
         let _starting = starting;
         let tokens = psr_psn::auth::exchange_code(&secret, &code)?;
@@ -565,7 +644,7 @@ async fn psn_signin(State(s): State<Arc<Service>>, body: Result<axum::Json<Signi
 }
 
 /// Forgets the saved sign-in here, as `ps-remote signout` does. It stays valid at Sony until it expires.
-async fn psn_signout(State(s): State<Arc<Service>>) -> Response {
+async fn psn_signout(State(s): State<Arc<Service>>, account: Account) -> Response {
     // Without the app secret the saved sign-in's folder is not known here; saying 204 would claim it was forgotten.
     let Some(psn) = s.psn.as_ref() else {
         return refuse(StatusCode::SERVICE_UNAVAILABLE, PSN_OFF);
@@ -576,7 +655,7 @@ async fn psn_signout(State(s): State<Arc<Service>>) -> Response {
     if session_running(&s) {
         return refuse(StatusCode::CONFLICT, "stop the session first: it would keep its own sign-in");
     }
-    let dir = psn.config_dir.clone();
+    let dir = s.psn_of(psn, &account);
     let done = tokio::task::spawn_blocking(move || {
         let _starting = starting;
         psr_psn::secret::forget(&dir)
@@ -600,7 +679,7 @@ struct PsnConsoleInfo {
 
 /// The PSN account's consoles (`docs/PSN.md`), from Sony: each call refreshes the saved sign-in, so it takes
 /// the start slot, and is refused while a start runs, as a second start would be.
-async fn psn_consoles(State(s): State<Arc<Service>>) -> Response {
+async fn psn_consoles(State(s): State<Arc<Service>>, account: Account) -> Response {
     let Some(psn) = s.psn.as_ref() else {
         return refuse(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -610,7 +689,7 @@ async fn psn_consoles(State(s): State<Arc<Service>>) -> Response {
     let Some(starting) = Starting::take(&s) else {
         return refuse(StatusCode::CONFLICT, "a session is starting");
     };
-    let (secret, dir) = (psn.app_secret.clone(), psn.config_dir.clone());
+    let (secret, dir) = (psn.app_secret.clone(), s.psn_of(psn, &account));
     let listed = tokio::task::spawn_blocking(move || {
         let _starting = starting;
         psr_psn::play::account_consoles(&secret, &dir)
@@ -637,7 +716,12 @@ async fn psn_consoles(State(s): State<Arc<Service>>) -> Response {
 
 /// Plays the account's console from away, through PSN (`docs/PSN.md`). No body: the console is the
 /// account's first with Remote Play on. Takes around 40 s.
-async fn play_psn(State(s): State<Arc<Service>>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+async fn play_psn(
+    State(s): State<Arc<Service>>,
+    account: Account,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
     let Some(psn) = s.psn.as_ref() else {
         return refuse(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -668,10 +752,10 @@ async fn play_psn(State(s): State<Arc<Service>>, headers: HeaderMap, body: axum:
     let Some(starting) = Starting::take(&s) else {
         return refuse(StatusCode::CONFLICT, "a session is already starting");
     };
-    if s.session().as_ref().is_some_and(Handle::is_running) {
+    if s.running() {
         return refuse(StatusCode::CONFLICT, "a session is already running");
     }
-    let (secret, dir) = (psn.app_secret.clone(), psn.config_dir.clone());
+    let (secret, dir) = (psn.app_secret.clone(), s.psn_of(psn, &account));
     let started = tokio::task::spawn_blocking(move || {
         let _starting = starting;
         runner::start_psn(&secret, &dir, quality, watch_only)
@@ -679,9 +763,9 @@ async fn play_psn(State(s): State<Arc<Service>>, headers: HeaderMap, body: axum:
     .await;
     match started {
         Ok(Ok(handle)) => {
-            let old = s.session().replace(handle);
+            let old = s.session().replace(Running { account, handle });
             if let Some(old) = old {
-                tokio::task::spawn_blocking(move || old.stop());
+                tokio::task::spawn_blocking(move || old.handle.stop());
             }
             StatusCode::NO_CONTENT.into_response()
         }
@@ -690,13 +774,18 @@ async fn play_psn(State(s): State<Arc<Service>>, headers: HeaderMap, body: axum:
     }
 }
 
-async fn offer(State(s): State<Arc<Service>>, body: String) -> Response {
+const SOMEONE_ELSE: &str = "another account is playing";
+
+async fn offer(State(s): State<Arc<Service>>, account: Account, body: String) -> Response {
+    // The answer joins the browser to the session's picture and input: only the account that started it.
+    let remote = match s.session().as_ref() {
+        None => return refuse(StatusCode::CONFLICT, "no session is running"),
+        Some(r) if r.account != account => return refuse(StatusCode::CONFLICT, SOMEONE_ELSE),
+        Some(r) => r.handle.remote(),
+    };
     let offer = match SdpOffer::from_sdp_string(&body) {
         Ok(o) => o,
         Err(_) => return refuse(StatusCode::BAD_REQUEST, "not an SDP offer"),
-    };
-    let Some(remote) = s.session().as_ref().map(Handle::remote) else {
-        return refuse(StatusCode::CONFLICT, "no session is running");
     };
     let answer = tokio::task::spawn_blocking(move || remote.offer(offer)).await;
     match answer {
@@ -710,22 +799,99 @@ async fn offer(State(s): State<Arc<Service>>, body: String) -> Response {
     }
 }
 
-async fn stop(State(s): State<Arc<Service>>) -> Response {
-    let handle = s.session().take();
-    if let Some(h) = handle {
-        let _ = tokio::task::spawn_blocking(move || h.stop()).await;
+async fn stop(State(s): State<Arc<Service>>, account: Account) -> Response {
+    let handle = {
+        let mut slot = s.session();
+        match slot.as_ref() {
+            Some(r) if r.account != account && r.handle.is_running() => {
+                return refuse(StatusCode::CONFLICT, SOMEONE_ELSE);
+            }
+            _ => slot.take(),
+        }
+    };
+    if let Some(r) = handle {
+        let _ = tokio::task::spawn_blocking(move || r.handle.stop()).await;
     }
     StatusCode::NO_CONTENT.into_response()
 }
 
-async fn status(State(s): State<Arc<Service>>) -> Response {
-    let st = s.session().as_ref().map(Handle::status);
-    axum::Json(st.unwrap_or_else(Status::default)).into_response()
+/// The session's status, with `yours`: whether this account started it. Another account's session shows only
+/// that one is running, not its numbers.
+async fn status(State(s): State<Arc<Service>>, account: Account) -> Response {
+    let (st, yours) = match s.session().as_ref() {
+        Some(r) if r.account == account => (r.handle.status(), true),
+        Some(r) => (Status { running: r.handle.is_running(), ..Status::default() }, false),
+        None => (Status::default(), false),
+    };
+    let mut v = serde_json::to_value(st).unwrap_or_default();
+    if let Some(o) = v.as_object_mut() {
+        o.insert("yours".into(), serde_json::Value::Bool(yours));
+    }
+    axum::Json(v).into_response()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn service_playing_as(owner: Option<&str>) -> Arc<Service> {
+        let s = Service::new("t".repeat(64), 9, std::env::temp_dir().join("ps-remote-owner-test"));
+        *s.session() = Some(Running { account: Account(owner.map(str::to_string)), handle: Handle::stand_in(true) });
+        s
+    }
+
+    async fn body(r: Response) -> String {
+        String::from_utf8(axum::body::to_bytes(r.into_body(), 1 << 16).await.unwrap().to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn only_the_account_that_started_a_session_may_join_or_stop_it() {
+        let s = service_playing_as(Some(A));
+        let theirs = Account(Some(B.into()));
+        let offer = stop(State(Arc::clone(&s)), theirs.clone()).await;
+        assert_eq!(offer.status(), StatusCode::CONFLICT);
+        assert!(s.running(), "another account did not stop it");
+        // This PC's own (no account) is another account too.
+        assert_eq!(stop(State(Arc::clone(&s)), Account(None)).await.status(), StatusCode::CONFLICT);
+        let sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n".to_string();
+        let r = offer_route(&s, theirs, sdp).await;
+        // Refused for being someone else's, before the offer is even read.
+        assert_eq!(r.status(), StatusCode::CONFLICT);
+        assert_eq!(body(r).await, SOMEONE_ELSE);
+        assert_eq!(stop(State(Arc::clone(&s)), Account(Some(A.into()))).await.status(), StatusCode::NO_CONTENT);
+        assert!(s.session().is_none(), "its own account stopped it");
+    }
+
+    async fn offer_route(s: &Arc<Service>, account: Account, sdp: String) -> Response {
+        offer(State(Arc::clone(s)), account, sdp).await
+    }
+
+    #[tokio::test]
+    async fn another_accounts_session_shows_only_that_one_runs() {
+        let s = service_playing_as(Some(A));
+        let mine: serde_json::Value =
+            serde_json::from_str(&body(status(State(Arc::clone(&s)), Account(Some(A.into()))).await).await).unwrap();
+        assert_eq!((mine["running"].as_bool(), mine["yours"].as_bool()), (Some(true), Some(true)));
+        let theirs: serde_json::Value =
+            serde_json::from_str(&body(status(State(Arc::clone(&s)), Account(Some(B.into()))).await).await).unwrap();
+        assert_eq!((theirs["running"].as_bool(), theirs["yours"].as_bool()), (Some(true), Some(false)));
+        assert_eq!(theirs["video"], serde_json::Value::Null);
+        let none = Service::new("t".repeat(64), 9, std::env::temp_dir().join("ps-remote-owner-test"));
+        let idle: serde_json::Value =
+            serde_json::from_str(&body(status(State(none), Account(None)).await).await).unwrap();
+        assert_eq!((idle["running"].as_bool(), idle["yours"].as_bool()), (Some(false), Some(false)));
+    }
+
+    #[test]
+    fn an_account_is_exactly_a_hashed_user_id() {
+        assert!(is_hashed_user_id(A));
+        for no in ["", "../../x", &A[..63], &format!("{A}a"), &A.to_uppercase(), &format!("{}g", &A[..63])] {
+            assert!(!is_hashed_user_id(no), "{no}");
+        }
+    }
 
     #[test]
     fn a_link_is_saved_only_for_the_console_that_answered() {

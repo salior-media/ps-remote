@@ -98,7 +98,10 @@ async fn serve(port: u16) -> Result<(), Error> {
     if psn.is_some() {
         println!("Playing over PSN is on.");
     }
-    axum::serve(listener, api::router(api::Service::with_psn(token, port, consoles_dir, psn))).await?;
+    // Each account game-play names keeps its PSN sign-in and consoles under accounts/<sub>/ (games scope next §4.1).
+    let accounts_dir = dir.join("accounts");
+    let service = api::Service::with_psn(token, port, consoles_dir, accounts_dir, psn);
+    axum::serve(listener, api::router(service)).await?;
     Ok(())
 }
 
