@@ -18,7 +18,7 @@ use serde::Serialize;
 use str0m::change::{SdpAnswer, SdpOffer};
 
 use crate::bridge::{Bridge, BridgeEvent};
-use crate::input::Touchpad;
+use crate::input::Controls;
 use crate::rate::Rate;
 
 /// How long one round of the loop waits for the console's datagrams. Short, because the browser's side is
@@ -41,6 +41,10 @@ pub struct Status {
     /// Video and audio received over the last second, in kilobits a second.
     pub bitrate_kbps: u64,
     pub bad_input: u64,
+    /// A watch-only session sends nothing the browser sends: it is shown, not played (`play`'s `watch_only`).
+    pub watch_only: bool,
+    /// Input messages a watch-only session received and dropped.
+    pub ignored_input: u64,
     /// Why the session ended, once it has.
     pub ended: Option<String>,
     /// The quality asked of the console: `"<width>x<height> at <fps> fps"`.
@@ -99,24 +103,34 @@ pub fn media_address(host: IpAddr) -> std::io::Result<IpAddr> {
 }
 
 /// Starts a session with `console` at `host` (this blocks for the session and stream handshakes, a second
-/// or two), then runs it on its own thread.
-pub fn start(host: IpAddr, console: &RegisteredHost, profile: VideoProfile) -> Result<Handle, String> {
+/// or two), then runs it on its own thread. A `watch_only` session drops the browser's input.
+pub fn start(
+    host: IpAddr,
+    console: &RegisteredHost,
+    profile: VideoProfile,
+    watch_only: bool,
+) -> Result<Handle, String> {
     let media_ip = media_address(host).map_err(|e| format!("no route to the console: {e}"))?;
     let ctrl = session::start(host, console, Codec::H264).map_err(|e| e.to_string())?;
     // A PS4 is not asked for 1080p, as chiaki-ng does not; a PS4 Pro could send it, but is not told apart here.
     let profile = if ctrl.target().is_ps5() { profile } else { profile.at_most_720p() };
     let stream = stream::connect(host, &ctrl, &profile).map_err(|e| e.to_string())?;
-    spawn(ctrl, stream, media_ip, None, profile)
+    spawn(ctrl, stream, media_ip, None, profile, watch_only)
 }
 
 /// Starts a session from away, through PSN (`psr_psn::play`; this blocks for the holepunch, around 40 s),
 /// then runs it as [`start`] does. Sony's session is left when the session ends.
-pub fn start_psn(app_secret: &str, config_dir: &Path, profile: VideoProfile) -> Result<Handle, String> {
+pub fn start_psn(
+    app_secret: &str,
+    config_dir: &Path,
+    profile: VideoProfile,
+    watch_only: bool,
+) -> Result<Handle, String> {
     let playing = psr_psn::play::connect(app_secret, config_dir, &profile, |_| {}).map_err(|e| e.to_string())?;
     // The browser is on this machine: its media goes to our address on the network the holes left by.
     let media_ip = IpAddr::V4(playing.local_ip);
     let (ctrl, stream, leaver) = playing.into_parts();
-    spawn(ctrl, stream, media_ip, Some(leaver), profile)
+    spawn(ctrl, stream, media_ip, Some(leaver), profile, watch_only)
 }
 
 fn spawn(
@@ -125,11 +139,12 @@ fn spawn(
     media_ip: IpAddr,
     psn: Option<psr_psn::play::Leaver>,
     profile: VideoProfile,
+    watch_only: bool,
 ) -> Result<Handle, String> {
-    let touchpad = Touchpad::new(ctrl.target().is_ps5());
+    let controls = Controls::new(ctrl.target().is_ps5(), watch_only);
     let (tx, rx) = mpsc::channel();
     let video = format!("{}x{} at {} fps", profile.width, profile.height, profile.max_fps);
-    let status = Arc::new(Mutex::new(Status { running: true, video: Some(video), ..Status::default() }));
+    let status = Arc::new(Mutex::new(Status { running: true, video: Some(video), watch_only, ..Status::default() }));
     let thread_status = Arc::clone(&status);
     let thread = std::thread::Builder::new()
         .name("ps-remote session".into())
@@ -143,7 +158,7 @@ fn spawn(
                 bridge: None,
                 header: Vec::new(),
                 psn,
-                touchpad,
+                controls,
                 rate: Rate::new(Instant::now()),
             };
             // Whatever happens in the loop, even a panic, the console is told the stream ended and the
@@ -192,8 +207,9 @@ struct Loop {
     header: Vec<u8>,
     /// Over PSN, what leaves Sony's session; dropped after the stream ends.
     psn: Option<psr_psn::play::Leaver>,
-    /// The browser's fingers, kept on the console's touch ids from one input message to the next.
-    touchpad: Touchpad,
+    /// Where the browser's input goes: its fingers kept on the console's touch ids from one message to the next,
+    /// or nowhere in a watch-only session.
+    controls: Controls,
     rate: Rate,
 }
 
@@ -297,11 +313,10 @@ impl Loop {
                     self.stream.request_keyframe().map_err(|e| e.to_string())?;
                 }
                 BridgeEvent::KeyframeRequested => self.stream.request_keyframe().map_err(|e| e.to_string())?,
-                BridgeEvent::Input(input) => {
-                    let mut state = input.state;
-                    (state.touches, state.touch_id_next) = self.touchpad.apply(&input.fingers);
-                    self.stream.set_controller_state(&state).map_err(|e| e.to_string())?;
-                }
+                BridgeEvent::Input(input) => match self.controls.apply(&input) {
+                    Some(state) => self.stream.set_controller_state(&state).map_err(|e| e.to_string())?,
+                    None => self.update(|s| s.ignored_input += 1),
+                },
                 BridgeEvent::BadInput => self.update(|s| s.bad_input += 1),
                 BridgeEvent::Closed => {
                     self.bridge = None;
@@ -316,7 +331,7 @@ impl Loop {
 
     /// Lets go of every button, so nothing stays held when a browser goes away.
     fn release_input(&mut self) -> Result<(), String> {
-        self.touchpad.clear();
+        self.controls.clear();
         self.stream.set_controller_state(&ControllerState::default()).map_err(|e| e.to_string())
     }
 

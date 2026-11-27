@@ -409,3 +409,25 @@ async fn play_over_psn_takes_a_quality_or_none() {
     let _ = c.read_to_end(&mut out).await;
     assert_eq!(&out[9..12], b"415", "{}", String::from_utf8_lossy(&out));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_can_be_asked_to_only_watch() {
+    let s = server().await;
+    link_fake_console(&s);
+    // Asked to watch, it passes the request's checks and goes on to look for the console.
+    let (code, answer) = post(&s, "/api/play", r#"{"host":"127.0.0.1","watch_only":true}"#).await;
+    assert_eq!(code, 400, "{answer}");
+    assert!(answer.contains("did not answer as"), "watch_only was accepted: {answer}");
+    let (code, _) = post(&s, "/api/play", r#"{"host":"127.0.0.1","watch_only":"yes"}"#).await;
+    assert_eq!(code, 422, "watch_only is true or false");
+    let (code, body) = get(&s, "/api/status").await;
+    assert_eq!(code, 200);
+    assert!(body.contains("\"watch_only\":false") && body.contains("\"ignored_input\":0"), "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn play_over_psn_refuses_a_watch_only_that_is_not_true_or_false() {
+    let s = server_psn().await;
+    let (code, answer) = post(&s, "/api/play-psn", r#"{"watch_only":1}"#).await;
+    assert_eq!(code, 400, "{answer}");
+}

@@ -52,7 +52,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|a| a.iter().find(|c| c["address"].is_string()))
         .ok_or("no linked console answered")?;
     println!("playing {} at {}", c["nickname"], c["address"]);
-    let play = serde_json::json!({ "host": c["address"], "console": c["mac"] }).to_string();
+    // PSR_WATCH_ONLY=1 asks for a watch-only session: the presses are then sent and must be dropped.
+    let watch_only = std::env::var_os("PSR_WATCH_ONLY").is_some_and(|v| v == "1");
+    let play =
+        serde_json::json!({ "host": c["address"], "console": c["mac"], "watch_only": watch_only }).to_string();
     http(port, &token, "POST", "/api/play", "application/json", &play)?;
 
     let mut rtc = RtcConfig::new().clear_codecs().enable_h264(true).enable_opus(true, false).build(Instant::now());
