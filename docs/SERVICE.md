@@ -60,7 +60,8 @@ from its own session. With it, the PSN sign-in and the linked consoles are that 
 `accounts/<sub>/` and `accounts/<sub>/consoles/` beside `consoles/`. Without it, a request uses this PC's own, as the
 command line and the examples do. Only a holder of the token can send the header, and that holder can already do
 anything the API does, so it is taken as given. One session runs at a time, whoever's; it belongs to the account that
-started it.
+started it. The start slot is shared too: while any account's session starts or runs, no account can sign in to or out
+of PSN, list its PSN consoles or link (409), because those also refresh or replace a saved sign-in.
 
 **Input** on the data channel `input` is a JSON object per change: `buttons` (psr-input's bits), `l2` and `r2`
 (0 to 255), and `lx`, `ly`, `rx` and `ry` (−32768 to 32767). The service checks each field's range and drops a message
