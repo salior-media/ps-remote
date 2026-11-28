@@ -39,7 +39,7 @@ async fn server_psn() -> Server {
     let port = listener.local_addr().unwrap().port();
     let token = api::new_token().unwrap();
     let psn = api::Psn { app_secret: "not-the-real-secret".into(), config_dir: dir.clone() };
-    let service = api::Service::with_psn(token.clone(), port, dir.clone(), Some(psn));
+    let service = api::Service::with_psn(token.clone(), port, dir.clone(), dir.join("accounts"), Some(psn));
     tokio::spawn(async move { axum::serve(listener, api::router(service)).await.unwrap() });
     Server { port, token, dir: TempDir(dir) }
 }
@@ -125,8 +125,10 @@ async fn with_the_token_the_routes_answer() {
     assert_eq!(code, 400, "no linked console to play");
     let (code, _) = request(s.port, "POST", "/api/play", &host, t, r#"{"host":"127.0.0.1","admin":true}"#).await;
     assert_eq!(code, 422, "unknown fields are refused");
-    let (code, _) = request(s.port, "POST", "/api/offer", &host, t, "not sdp").await;
-    assert_eq!(code, 400);
+    // Whose session it is is checked before the offer is read (an offer joins that session), so with none running
+    // even a body that is not SDP is answered 409.
+    let (code, body) = request(s.port, "POST", "/api/offer", &host, t, "not sdp").await;
+    assert_eq!((code, body.as_str()), (409, "no session is running"));
     let (code, _) = request(s.port, "POST", "/api/stop", &host, t, "").await;
     assert_eq!(code, 204, "stopping nothing is fine");
 }
@@ -430,4 +432,81 @@ async fn play_over_psn_refuses_a_watch_only_that_is_not_true_or_false() {
     let s = server_psn().await;
     let (code, answer) = post(&s, "/api/play-psn", r#"{"watch_only":1}"#).await;
     assert_eq!(code, 400, "{answer}");
+}
+
+const SUB_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const SUB_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+/// A GET with the token, the right Host and game-play's account header, each value given sent as one header.
+async fn get_as(s: &Server, path: &str, accounts: &[&str]) -> (u16, String) {
+    let mut st = tokio::net::TcpStream::connect(("127.0.0.1", s.port)).await.unwrap();
+    let mut req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\n", s.port, s.token);
+    for a in accounts {
+        req += &format!("X-PS-Remote-Account: {a}\r\n");
+    }
+    req += "Connection: close\r\n\r\n";
+    st.write_all(req.as_bytes()).await.unwrap();
+    let mut out = Vec::new();
+    let _ = st.read_to_end(&mut out).await;
+    let out = String::from_utf8_lossy(&out).to_string();
+    let code = out.get(9..12).and_then(|c| c.parse().ok()).unwrap_or(0);
+    (code, out.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_account_header_that_is_not_a_hashed_user_id_is_refused() {
+    let s = server_psn().await;
+    for bad in ["../../etc", "AAAA", &SUB_A.to_uppercase(), &SUB_A[..63], "aaaa aaaa"] {
+        let (code, body) = get_as(&s, "/api/psn-status", &[bad]).await;
+        assert_eq!(code, 400, "{bad}: {body}");
+    }
+    let (code, _) = get_as(&s, "/api/psn-status", &[SUB_A, SUB_B]).await;
+    assert_eq!(code, 400, "two accounts in one request");
+    assert!(!s.dir.0.join("accounts").exists(), "no folder was made for a refused account");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_account_has_its_own_psn_sign_in() {
+    let s = server_psn().await;
+    psr_psn::secret::save_refresh_token(&s.dir.0.join("accounts").join(SUB_A), "a-made-up-refresh-token").unwrap();
+    let signed_in = r#"{"available":true,"signed_in":true}"#;
+    let signed_out = r#"{"available":true,"signed_in":false}"#;
+    assert_eq!(get_as(&s, "/api/psn-status", &[SUB_A]).await, (200, signed_in.into()));
+    assert_eq!(get_as(&s, "/api/psn-status", &[SUB_B]).await, (200, signed_out.into()));
+    assert_eq!(get_as(&s, "/api/psn-status", &[]).await, (200, signed_out.into()), "this PC's own is apart too");
+
+    // Signing B out forgets nothing of A's.
+    let mut st = tokio::net::TcpStream::connect(("127.0.0.1", s.port)).await.unwrap();
+    let req = format!(
+        "POST /api/psn-signout HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\nX-PS-Remote-Account: {SUB_B}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        s.port, s.token
+    );
+    st.write_all(req.as_bytes()).await.unwrap();
+    let mut out = Vec::new();
+    let _ = st.read_to_end(&mut out).await;
+    assert!(String::from_utf8_lossy(&out).starts_with("HTTP/1.1 204"));
+    assert_eq!(get_as(&s, "/api/psn-status", &[SUB_A]).await, (200, signed_in.into()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_account_sees_only_its_own_linked_consoles() {
+    let s = server().await;
+    let host = psr_lan::regist::RegisteredHost {
+        target: psr_crypto::Target::Ps5V1,
+        ap_ssid: None,
+        ap_bssid: None,
+        ap_key: None,
+        ap_name: None,
+        server_mac: [0x02, 0, 0, 0, 0, 0x0a],
+        server_nickname: Some("a's console".into()),
+        rp_regist_key: [0x31; 16],
+        rp_key_type: 2,
+        rp_key: [0x5a; 16],
+    };
+    psr_lan::store::save(&s.dir.0.join("accounts").join(SUB_A).join("consoles"), &host).unwrap();
+    let (code, body) = get_as(&s, "/api/consoles", &[SUB_A]).await;
+    assert_eq!(code, 200);
+    assert!(body.contains("a's console"), "{body}");
+    assert_eq!(get_as(&s, "/api/consoles", &[SUB_B]).await, (200, "[]".into()));
+    assert_eq!(get_as(&s, "/api/consoles", &[]).await, (200, "[]".into()));
 }

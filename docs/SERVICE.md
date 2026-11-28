@@ -50,9 +50,18 @@ takes it off the address bar once read. The page itself holds no token, because 
 | `GET /api/psn-signin-url` | `{"url"}`: Sony's sign-in page for the Remote Play app, with a new client device ID, as `ps-remote signin` prints it. 503 without the app secret |
 | `POST /api/psn-signin` | `{"redirect": "<the address of Sony's redirect page>"}` trades the one-time code in it for tokens and saves the refresh token, as `ps-remote signin` does. Only Sony's redirect page is accepted, the address is never echoed, and nothing is answered but 204 or the reason. Takes the start slot, and is refused (409) while a start or a session runs |
 | `POST /api/psn-signout` | forgets the saved sign-in on this machine, as `ps-remote signout` does (it stays valid at Sony until it expires). 503 without the app secret, 409 while a start or a session runs |
-| `POST /api/offer` | the browser's SDP offer, answered with the service's SDP answer |
-| `POST /api/stop` | ends the session |
-| `GET /api/status` | whether a session runs, its frame, loss and drop counts, `bitrate_kbps`: the video and audio received over the last second, `video`: the quality asked for (`"1280x720 at 60 fps"`), and `watch_only` with `ignored_input`, the input messages a watch-only session dropped. The console-to-service delay is not reported: chiaki-ng's way to measure it (Senkusha) is compiled there but never switched on, as no build defines `ENABLE_SENKUSHA`. The test page shows the browser's share instead, from WebRTC's own counters: the browser-to-service round trip, and per frame the time buffered, decoding, and from received to shown |
+| `POST /api/offer` | the browser's SDP offer, answered with the service's SDP answer. Only from the account that started the session: another gets 409 *another account is playing* before the offer is read, and with no session running it is 409 too |
+| `POST /api/stop` | ends the session. Another account's running session is not stopped (409) |
+| `GET /api/status` | whether a session runs, its frame, loss and drop counts, `bitrate_kbps`: the video and audio received over the last second, `video`: the quality asked for (`"1280x720 at 60 fps"`), and `watch_only` with `ignored_input`, the input messages a watch-only session dropped. `yours` says whether the asking account started it; another account's session shows only `running`. The console-to-service delay is not reported: chiaki-ng's way to measure it (Senkusha) is compiled there but never switched on, as no build defines `ENABLE_SENKUSHA`. The test page shows the browser's share instead, from WebRTC's own counters: the browser-to-service round trip, and per frame the time buffered, decoding, and from received to shown |
+
+**Accounts** (games scope *PlayStation next* §4.1). A request may carry `X-PS-Remote-Account`, an Authentik
+`hashed_user_id` (64 lowercase hex; anything else, or two of them, is 400). game-play sends it for the signed-in person,
+from its own session. With it, the PSN sign-in and the linked consoles are that account's own, in
+`accounts/<sub>/` and `accounts/<sub>/consoles/` beside `consoles/`. Without it, a request uses this PC's own, as the
+command line and the examples do. Only a holder of the token can send the header, and that holder can already do
+anything the API does, so it is taken as given. One session runs at a time, whoever's; it belongs to the account that
+started it. The start slot is shared too: while any account's session starts or runs, no account can sign in to or out
+of PSN, list its PSN consoles or link (409), because those also refresh or replace a saved sign-in.
 
 **Input** on the data channel `input` is a JSON object per change: `buttons` (psr-input's bits), `l2` and `r2`
 (0 to 255), and `lx`, `ly`, `rx` and `ry` (−32768 to 32767). The service checks each field's range and drops a message

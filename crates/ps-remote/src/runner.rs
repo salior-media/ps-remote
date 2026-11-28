@@ -183,6 +183,13 @@ impl Handle {
         self.status().running
     }
 
+    /// A session with no console behind it, that only says whether it runs: for the API's own tests.
+    #[cfg(test)]
+    pub(crate) fn stand_in(running: bool) -> Self {
+        let (tx, _) = mpsc::channel();
+        Handle { tx, status: Arc::new(Mutex::new(Status { running, ..Status::default() })), thread: None }
+    }
+
     pub fn remote(&self) -> Remote {
         Remote { tx: self.tx.clone(), status: Arc::clone(&self.status) }
     }
